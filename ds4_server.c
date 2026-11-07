@@ -10856,6 +10856,7 @@ typedef enum {
     KV_REASON_CONTINUED = DS4_KVSTORE_REASON_CONTINUED,
     KV_REASON_EVICT     = DS4_KVSTORE_REASON_EVICT,
     KV_REASON_SHUTDOWN  = DS4_KVSTORE_REASON_SHUTDOWN,
+    KV_REASON_TURN_END  = DS4_KVSTORE_REASON_TURN_END,
 } kv_cache_reason;
 
 
@@ -12964,6 +12965,76 @@ static void remember_thinking_checkpoint(server *s, server_slot *slot,
     free(visible);
 }
 
+static bool turn_end_finish_is_final(const char *finish) {
+    return finish && (!strcmp(finish, "stop") || !strcmp(finish, "tool_calls"));
+}
+
+/* A finished turn leaves the live graph at prompt + sampled reply.  A client
+ * that replays reasoning renders those same bytes at the front of its next
+ * prompt, so store the whole frontier keyed by its own token text.  Another
+ * slot, or a restarted server, then resumes after this turn instead of
+ * prefilling its tail again from the boundary below it.  The store is exact:
+ * no boundary trim or alignment, and it leaves the continued-interval
+ * bookkeeping alone so later chunk boundaries are still stored. */
+static void kv_cache_store_turn_end(server *s, server_slot *slot, job *j,
+                                    const char *ctx, uint64_t trace_id,
+                                    const char *decode_finish,
+                                    const char *finish, bool client_stop) {
+    if (!s || !slot || !j || !s->kv.enabled) return;
+    const ds4_tokens *tokens = ds4_session_tokens(slot->session);
+    const int live = tokens ? tokens->len : 0;
+    const char *skip = NULL;
+    if (job_cancelled(j)) skip = "cancelled";
+    else if (g_stop_requested) skip = "shutdown";
+    else if (!turn_end_finish_is_final(decode_finish) ||
+             !turn_end_finish_is_final(finish))
+        skip = "unfinished";
+    else if (client_stop) skip = "client-stop";
+    else if (j->req.image_count != 0) skip = "multimodal";
+    else if (live < s->kv.opt.min_tokens) skip = "short";
+
+    bool existing = false;
+    uint64_t file_size = 0;
+    size_t text_len = 0;
+    double store_ms = 0.0;
+    if (!skip) {
+        /* Render the key only to report it; the store renders the same tokens
+         * again and remains the only writer of the file. */
+        char *text = render_tokens_text(s->engine, tokens, &text_len);
+        char sha[41];
+        ds4_kvstore_sha1_bytes_hex(text, text_len, sha);
+        free(text);
+        char *path = ds4_kvstore_path_for_sha(&s->kv, sha);
+        existing = access(path, F_OK) == 0;
+        const double t0 = now_sec();
+        if (kv_cache_store_live_prefix(s, slot, tokens, live, "turn-end")) {
+            struct stat st;
+            if (stat(path, &st) == 0) file_size = (uint64_t)st.st_size;
+        } else {
+            skip = "store-failed";
+        }
+        store_ms = (now_sec() - t0) * 1000.0;
+        free(path);
+    }
+    if (skip) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: kv cache turn-end skipped ctx=%s finish=%s live=%d reason=%s",
+                   ctx, finish ? finish : "none", live, skip);
+        trace_event(s, trace_id,
+                    "turn-end checkpoint skipped: finish=%s live=%d reason=%s",
+                    finish ? finish : "none", live, skip);
+        return;
+    }
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: kv cache turn-end stored ctx=%s finish=%s tokens=%d text=%zu size=%.2f MiB existing=%d store=%.1f ms",
+               ctx, finish, live, text_len,
+               (double)file_size / (1024.0 * 1024.0), existing ? 1 : 0, store_ms);
+    trace_event(s, trace_id,
+                "turn-end checkpoint stored: tokens=%d text=%zu size=%llu existing=%d store_ms=%.1f",
+                live, text_len, (unsigned long long)file_size, existing ? 1 : 0,
+                store_ms);
+}
+
 /* Match clients that omit reasoning, while keeping the exact sampled KV.
  * Tool decoding stops at </tool_call>, BEFORE the assistant end token. Leave
  * <|im_end|> out of the visible key so the next suffix actually evaluates it. */
@@ -14777,6 +14848,11 @@ decode_again:
                        now_sec() - t0);
         }
     }
+    /* The response is out and every rewrite of the frontier (speculative
+     * rewind, tool canonicalization) has settled, so the live state is final.
+     * Storing after the reply keeps the disk write behind the response. */
+    kv_cache_store_turn_end(s, slot, j, ctx_span, trace_id, finish,
+                            final_finish, client_stop);
     free(parsed_content);
     free(parsed_reasoning);
     tool_calls_free(&parsed_calls);
@@ -22229,6 +22305,74 @@ static void test_kv_cache_eviction_prefers_superseded_continued_prefix(void) {
     rmdir(dir);
 }
 
+static void test_kv_cache_turn_end_reason_is_plain_entry(void) {
+    char tmpl[] = "/tmp/ds4-kv-turn-end-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    TEST_ASSERT(ds4_kvstore_reason_code("turn-end") == KV_REASON_TURN_END);
+
+    /* Both entries are byte prefixes of the incoming text.  Only the
+     * continued one is superseded by it; the turn-end entry stays. */
+    const char *continued_text = "system: hello";
+    const char *turn_end_text = "system: hello world";
+    const char *incoming_text = "system: hello world\nuser: prompt";
+    test_kv_text_stub_file(dir, continued_text, KV_REASON_CONTINUED, 4096, 2048);
+    test_kv_text_stub_file(dir, turn_end_text, KV_REASON_TURN_END, 4096, 2048);
+
+    char continued_sha[41], turn_end_sha[41];
+    sha1_bytes_hex(continued_text, strlen(continued_text), continued_sha);
+    sha1_bytes_hex(turn_end_text, strlen(turn_end_text), turn_end_sha);
+    char continued_name[44], turn_end_name[44];
+    snprintf(continued_name, sizeof(continued_name), "%.40s.kv", continued_sha);
+    snprintf(turn_end_name, sizeof(turn_end_name), "%.40s.kv", turn_end_sha);
+    char *continued_path = path_join(dir, continued_name);
+    char *turn_end_path = path_join(dir, turn_end_name);
+
+    kv_entry e = {0};
+    TEST_ASSERT(ds4_kvstore_read_entry_file(turn_end_path, turn_end_sha, &e));
+    TEST_ASSERT(e.reason == KV_REASON_TURN_END);
+
+    ds4_kvstore_eviction_context incoming = {
+        .text = incoming_text,
+        .text_len = strlen(incoming_text),
+        .model_id = 0,
+        .quant_bits = 2,
+        .ctx_size = 32768,
+        .reject_different_quant = false,
+    };
+    const uint64_t now = e.last_used;
+    const double turn_end_score = kv_entry_eviction_score(&e, NULL, now, &incoming);
+    kv_entry other = e;
+    other.reason = KV_REASON_UNKNOWN;
+    TEST_ASSERT(kv_entry_eviction_score(&other, NULL, now, &incoming) == turn_end_score);
+    other.reason = KV_REASON_COLD;
+    TEST_ASSERT(kv_entry_eviction_score(&other, NULL, now, &incoming) > turn_end_score);
+    other.reason = KV_REASON_CONTINUED;
+    TEST_ASSERT(kv_entry_eviction_score(&other, NULL, now, &incoming) < turn_end_score);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    uint64_t incoming_bytes =
+        KV_CACHE_FIXED_HEADER + 4u + strlen(incoming_text) + 2048u;
+    kc.budget_bytes =
+        incoming_bytes + KV_CACHE_FIXED_HEADER + 4u + strlen(turn_end_text) + 2048u;
+    kv_cache_evict(&kc, NULL, incoming_bytes, &incoming);
+
+    TEST_ASSERT(access(continued_path, F_OK) != 0);
+    TEST_ASSERT(access(turn_end_path, F_OK) == 0);
+
+    kv_cache_close(&kc);
+    unlink(continued_path);
+    unlink(turn_end_path);
+    free(continued_path);
+    free(turn_end_path);
+    rmdir(dir);
+}
+
 static void test_kv_cache_eviction_keeps_smaller_context_prefix(void) {
     char tmpl[] = "/tmp/ds4-kv-prefix-ctx-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -22610,6 +22754,75 @@ static void test_thinking_canonical_with_tools_preserves_reasoning(void) {
     free(prompt_text);
     chat_msgs_free(&msgs);
     chat_msgs_free(&history);
+}
+
+static void test_turn_end_key_prefixes_next_prompt(void) {
+    /* Decode stops on the end token without evaluating it, so a finished
+     * turn's live tokens render as prompt + reasoning + </think> + content.
+     * In tool context DeepSeek keeps earlier reasoning, so a client that
+     * replays reasoning_content renders those bytes, then the end token, at
+     * the front of its next prompt: the turn-end key is a byte prefix. */
+    static const server_model_syntax syntaxes[] = {
+        SERVER_MODEL_SYNTAX_DEEPSEEK,
+        SERVER_MODEL_SYNTAX_DEEPSEEK41,
+    };
+    const char *tool_schemas = "{\"name\":\"bash\"}";
+    const char *reasoning = "The user wants a listing, so I run ls.";
+    const char *content = "Here you go.";
+
+    chat_msgs first = {0};
+    chat_msg u = {0};
+    u.role = xstrdup("user");
+    u.content = xstrdup("run ls");
+    chat_msgs_push(&first, u);
+
+    chat_msgs next = {0};
+    chat_msg nu = {0}; nu.role = xstrdup("user"); nu.content = xstrdup("run ls");
+    chat_msgs_push(&next, nu);
+    chat_msg na = {0}; na.role = xstrdup("assistant");
+    na.reasoning = xstrdup(reasoning);
+    na.content = xstrdup(content);
+    chat_msgs_push(&next, na);
+    chat_msg nu2 = {0}; nu2.role = xstrdup("user"); nu2.content = xstrdup("thanks");
+    chat_msgs_push(&next, nu2);
+
+    for (size_t i = 0; i < sizeof(syntaxes) / sizeof(syntaxes[0]); i++) {
+        for (int with_tools = 1; with_tools >= 0; with_tools--) {
+            const char *schemas = with_tools ? tool_schemas : NULL;
+            char *prompt = render_chat_prompt_text_for_syntax(
+                syntaxes[i], &first, schemas, NULL, DS4_THINK_HIGH);
+            size_t pt_len = strlen(prompt);
+            TEST_ASSERT(pt_len >= 7);
+            TEST_ASSERT(!memcmp(prompt + pt_len - 7, "<think>", 7));
+
+            buf live = {0};
+            buf_puts(&live, prompt);
+            buf_puts(&live, reasoning);
+            buf_puts(&live, "</think>");
+            buf_puts(&live, content);
+            const size_t live_len = live.len;
+            buf_puts(&live, "<" "\xef\xbd\x9c" "end" "\xe2\x96\x81" "of" "\xe2\x96\x81" "sentence" "\xef\xbd\x9c" ">");
+
+            char *future = render_chat_prompt_text_for_syntax(
+                syntaxes[i], &next, schemas, NULL, DS4_THINK_HIGH);
+            const size_t future_len = strlen(future);
+            if (with_tools) {
+                TEST_ASSERT(future_len > live.len);
+                TEST_ASSERT(!memcmp(future, live.ptr, live.len));
+            } else {
+                /* Without tool context the earlier reasoning is dropped, so
+                 * only the in-memory thinking-visible key can match. */
+                TEST_ASSERT(strstr(future, reasoning) == NULL);
+                TEST_ASSERT(future_len < live_len ||
+                            memcmp(future, live.ptr, live_len) != 0);
+            }
+            free(future);
+            buf_free(&live);
+            free(prompt);
+        }
+    }
+    chat_msgs_free(&first);
+    chat_msgs_free(&next);
 }
 
 static void test_thinking_canonical_non_thinking_mode_noop(void) {
@@ -23154,6 +23367,7 @@ static void ds4_server_unit_tests_run(void) {
     test_thinking_canonical_empty_content();
     test_thinking_canonical_multi_turn();
     test_thinking_canonical_with_tools_preserves_reasoning();
+    test_turn_end_key_prefixes_next_prompt();
     test_thinking_canonical_non_thinking_mode_noop();
     test_openai_inline_image_content();
     test_http_image_paths_and_urls_are_rejected();
@@ -23199,6 +23413,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_makes_room_before_store();
     test_kv_cache_eviction_ignores_oversize_incoming();
     test_kv_cache_eviction_prefers_superseded_continued_prefix();
+    test_kv_cache_turn_end_reason_is_plain_entry();
     test_kv_cache_eviction_keeps_smaller_context_prefix();
     test_kv_cache_eviction_score_decays_stale_hits();
     test_kv_cache_eviction_decayed_hits_tie_break_by_age();

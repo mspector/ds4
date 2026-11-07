@@ -179,6 +179,7 @@ uint8_t ds4_kvstore_reason_code(const char *reason) {
     if (!strcmp(reason, "shutdown")) return DS4_KVSTORE_REASON_SHUTDOWN;
     if (!strcmp(reason, "agent-system")) return DS4_KVSTORE_REASON_AGENT_SYSTEM;
     if (!strcmp(reason, "agent-session")) return DS4_KVSTORE_REASON_AGENT_SESSION;
+    if (!strcmp(reason, "turn-end")) return DS4_KVSTORE_REASON_TURN_END;
     return DS4_KVSTORE_REASON_UNKNOWN;
 }
 
@@ -428,7 +429,7 @@ bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,
         h[2] != KV_CACHE_MAGIC2 || h[3] != KV_CACHE_VERSION) return false;
     if (h[20] != KV_CACHE_PAYLOAD_ABI) return false;
     e->quant_bits = h[4];
-    e->reason = h[5] <= DS4_KVSTORE_REASON_AGENT_SESSION ? h[5] :
+    e->reason = h[5] <= DS4_KVSTORE_REASON_TURN_END ? h[5] :
                 DS4_KVSTORE_REASON_UNKNOWN;
     e->ext_flags = h[6];
     e->model_id = h[7];

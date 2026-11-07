@@ -25,6 +25,7 @@ typedef enum {
     DS4_KVSTORE_REASON_SHUTDOWN  = 4,
     DS4_KVSTORE_REASON_AGENT_SYSTEM  = 5,
     DS4_KVSTORE_REASON_AGENT_SESSION = 6,
+    DS4_KVSTORE_REASON_TURN_END      = 7,
 } ds4_kvstore_reason;
 
 typedef enum {
