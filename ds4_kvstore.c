@@ -565,26 +565,31 @@ double ds4_kvstore_entry_eviction_score(
     return score;
 }
 
-void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
+bool ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
                        uint64_t extra_bytes,
                        const ds4_kvstore_eviction_context *incoming) {
-    if (!kc->enabled || kc->budget_bytes == 0) return;
-    if (extra_bytes > kc->budget_bytes) return;
+    if (!kc->enabled || kc->budget_bytes == 0) return true;
+    if (extra_bytes > kc->budget_bytes) return false;
     kv_cache_refresh(kc);
     const uint64_t now = (uint64_t)time(NULL);
-    uint64_t total = 0;
-    for (int i = 0; i < kc->len; i++) total += kc->entry[i].file_size;
+    uint64_t total = 0, pinned = 0;
+    for (int i = 0; i < kc->len; i++) {
+        total += kc->entry[i].file_size;
+        if (ds4_kvstore_is_pinned(kc, kc->entry[i].sha))
+            pinned += kc->entry[i].file_size;
+    }
     const uint64_t target = kc->budget_bytes - extra_bytes;
+    /* Pinned entries stay; when they alone leave no room, evict nothing. */
+    if (pinned > target) return false;
     while (total > target && kc->len > 0) {
-        int victim = 0;
-        double victim_score =
-            ds4_kvstore_entry_eviction_score(&kc->entry[0], live, now,
-                                             incoming);
-        for (int i = 1; i < kc->len; i++) {
+        int victim = -1;
+        double victim_score = 0.0;
+        for (int i = 0; i < kc->len; i++) {
+            if (ds4_kvstore_is_pinned(kc, kc->entry[i].sha)) continue;
             double score =
                 ds4_kvstore_entry_eviction_score(&kc->entry[i], live, now,
                                                  incoming);
-            if (score < victim_score ||
+            if (victim < 0 || score < victim_score ||
                 (score == victim_score &&
                  kc->entry[i].last_used < kc->entry[victim].last_used))
             {
@@ -592,6 +597,7 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
                 victim_score = score;
             }
         }
+        if (victim < 0) break; /* only pinned entries remain */
         ds4_kvstore_entry e = kc->entry[victim];
         if (unlink(e.path) == 0) {
             kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
@@ -611,6 +617,52 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
                 (size_t)(kc->len - victim - 1) * sizeof(kc->entry[0]));
         kc->len--;
     }
+    return total <= target;
+}
+
+static int kv_pin_index(const ds4_kvstore *kc, const char sha[41]) {
+    for (int i = 0; i < kc->pin_len; i++) {
+        if (!strcmp(kc->pin[i], sha)) return i;
+    }
+    return -1;
+}
+
+void ds4_kvstore_pin(ds4_kvstore *kc, const char sha[41]) {
+    if (!kc || !sha || kv_pin_index(kc, sha) >= 0) return;
+    if (kc->pin_len == kc->pin_cap) {
+        kc->pin_cap = kc->pin_cap ? kc->pin_cap * 2 : 16;
+        kc->pin = kv_xrealloc(kc->pin, (size_t)kc->pin_cap * sizeof(kc->pin[0]));
+    }
+    snprintf(kc->pin[kc->pin_len++], sizeof(kc->pin[0]), "%s", sha);
+}
+
+bool ds4_kvstore_is_pinned(const ds4_kvstore *kc, const char sha[41]) {
+    return kc && sha && kv_pin_index(kc, sha) >= 0;
+}
+
+int ds4_kvstore_unpin_all(ds4_kvstore *kc) {
+    if (!kc) return 0;
+    const int n = kc->pin_len;
+    free(kc->pin);
+    kc->pin = NULL;
+    kc->pin_len = 0;
+    kc->pin_cap = 0;
+    return n;
+}
+
+int ds4_kvstore_pinned_count(const ds4_kvstore *kc) {
+    return kc ? kc->pin_len : 0;
+}
+
+uint64_t ds4_kvstore_pinned_bytes(ds4_kvstore *kc) {
+    if (!kc || kc->pin_len == 0) return 0;
+    kv_cache_refresh(kc);
+    uint64_t bytes = 0;
+    for (int i = 0; i < kc->len; i++) {
+        if (ds4_kvstore_is_pinned(kc, kc->entry[i].sha))
+            bytes += kc->entry[i].file_size;
+    }
+    return bytes;
 }
 
 bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
@@ -653,6 +705,7 @@ bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
 
 void ds4_kvstore_close(ds4_kvstore *kc) {
     ds4_kvstore_clear(kc);
+    ds4_kvstore_unpin_all(kc);
     free(kc->dir);
     memset(kc, 0, sizeof(*kc));
 }
@@ -931,6 +984,18 @@ static void kv_cache_rewrite_trailer(ds4_kvstore *kc, const char *path,
     (void)ok;
 }
 
+/* Every store passes here once its entry is on disk, written now or found
+ * already there; the store pins it when the request it serves asked. */
+static void kv_cache_pin_stored(ds4_kvstore *kc, const char sha[41],
+                                int tokens, const char *reason,
+                                const char *path) {
+    if (!kc->pin_stores || ds4_kvstore_is_pinned(kc, sha)) return;
+    ds4_kvstore_pin(kc, sha);
+    kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+            "%s: kv cache pinned tokens=%d reason=%s file=%s",
+            kv_log_name(kc), tokens, reason, path);
+}
+
 bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         ds4_engine *engine,
                                         ds4_session *session,
@@ -1009,6 +1074,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                      model_id,
                                      quant_bits, ds4_session_ctx(session))) {
         kv_cache_rewrite_trailer(kc, path, text, hooks);
+        kv_cache_pin_stored(kc, sha, store_tokens.len, reason, path);
         free(text);
         free(path);
         ds4_tokens_free(&store_tokens);
@@ -1060,7 +1126,21 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         .ctx_size = (uint32_t)ds4_session_ctx(session),
         .reject_different_quant = kc->reject_different_quant,
     };
-    ds4_kvstore_evict(kc, live_tokens, est_file_bytes, &incoming);
+    if (!ds4_kvstore_evict(kc, live_tokens, est_file_bytes, &incoming)) {
+        kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                "%s: kv cache skipped tokens=%d reason=%s because pinned checkpoints (%.2f MiB) leave no room for %.2f MiB in budget %.2f MiB",
+                kv_log_name(kc),
+                store_tokens.len,
+                reason,
+                (double)ds4_kvstore_pinned_bytes(kc) / (1024.0 * 1024.0),
+                (double)est_file_bytes / (1024.0 * 1024.0),
+                (double)kc->budget_bytes / (1024.0 * 1024.0));
+        ds4_session_payload_file_free(&staged);
+        free(text);
+        free(path);
+        ds4_tokens_free(&store_tokens);
+        return false;
+    }
 
     kv_buf tmpb = {0};
     kv_buf_printf(&tmpb, "%s.tmp.%ld", path, (long)getpid());
@@ -1156,6 +1236,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                 text_override ? (cache_text_key ? cache_text_key : "visible-transcript") : "token-text",
                 (double)(DS4_KVSTORE_FIXED_HEADER + 4ull + text_len + payload_bytes + trailer_bytes) / (1024.0 * 1024.0),
                 save_ms);
+        kv_cache_pin_stored(kc, sha, store_tokens.len, reason, path);
     }
     ds4_session_payload_file_free(&staged);
     free(tmp);
@@ -1198,6 +1279,18 @@ bool ds4_kvstore_maybe_store_continued(ds4_kvstore *kc,
     return false;
 }
 
+static bool kv_cache_entry_may_prefix(const ds4_kvstore *kc,
+                                      const ds4_kvstore_entry *e,
+                                      size_t prompt_bytes, int model_id,
+                                      int quant_bits, int ctx_size) {
+    if (e->text_bytes > prompt_bytes || e->text_bytes > SIZE_MAX) return false;
+    if ((int)e->tokens < kc->opt.min_tokens) return false;
+    if (e->model_id != (uint8_t)model_id) return false;
+    if ((uint32_t)ctx_size < e->ctx_size) return false;
+    if (kc->reject_different_quant && e->quant_bits != (uint8_t)quant_bits) return false;
+    return true;
+}
+
 int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
                                  int model_id, int quant_bits, int ctx_size) {
     if (!prompt_text) return -1;
@@ -1206,11 +1299,8 @@ int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
     int best = -1;
     for (int i = 0; i < kc->len; i++) {
         ds4_kvstore_entry *e = &kc->entry[i];
-        if (e->text_bytes > prompt_bytes || e->text_bytes > SIZE_MAX) continue;
-        if ((int)e->tokens < kc->opt.min_tokens) continue;
-        if (e->model_id != (uint8_t)model_id) continue;
-        if ((uint32_t)ctx_size < e->ctx_size) continue;
-        if (kc->reject_different_quant && e->quant_bits != (uint8_t)quant_bits) continue;
+        if (!kv_cache_entry_may_prefix(kc, e, prompt_bytes, model_id,
+                                       quant_bits, ctx_size)) continue;
         if (best >= 0) {
             ds4_kvstore_entry *b = &kc->entry[best];
             if (e->text_bytes < b->text_bytes) continue;
@@ -1221,6 +1311,27 @@ int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
         if (!strcmp(sha, e->sha)) best = i;
     }
     return best;
+}
+
+int ds4_kvstore_count_text_prefixes(ds4_kvstore *kc, const char *prompt_text,
+                                    int model_id, int quant_bits, int ctx_size,
+                                    int *pinned_out) {
+    if (pinned_out) *pinned_out = 0;
+    if (!prompt_text) return 0;
+    const size_t prompt_bytes = strlen(prompt_text);
+    kv_cache_refresh(kc);
+    int count = 0;
+    for (int i = 0; i < kc->len; i++) {
+        ds4_kvstore_entry *e = &kc->entry[i];
+        if (!kv_cache_entry_may_prefix(kc, e, prompt_bytes, model_id,
+                                       quant_bits, ctx_size)) continue;
+        char sha[41];
+        ds4_kvstore_sha1_bytes_hex(prompt_text, (size_t)e->text_bytes, sha);
+        if (strcmp(sha, e->sha)) continue;
+        count++;
+        if (pinned_out && ds4_kvstore_is_pinned(kc, e->sha)) (*pinned_out)++;
+    }
+    return count;
 }
 
 int ds4_kvstore_try_load_text(ds4_kvstore *kc,

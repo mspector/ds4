@@ -826,6 +826,9 @@ typedef struct {
     bool ignore_eos;
     int cache_read_tokens;
     int cache_write_tokens;
+    /* X-Cache-Pin: on.  Every checkpoint stored of this request's state is
+     * pinned against eviction (see server_slot.cache_pin). */
+    bool cache_pin;
     ds4_think_mode think_mode;
     bool has_tools;
     bool prompt_preserves_reasoning;
@@ -4116,8 +4119,11 @@ static void anthropic_prepare_live_continuation(server *s, request *r,
  * fields that affect model semantics, rendering, streaming, or cache keys, and
  * skip extension fields.  The output is always a rendered DS4 chat/completion
  * prompt plus the small amount of protocol state needed to translate the reply. */
-static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_tokens,
-                               int ctx_size, request *r, char *err, size_t errlen) {
+/* cache_probe: the body of POST /admin/api/cache/probe, which names the model
+ * "model_id" and must not encode images (that takes inference_mu). */
+static bool parse_chat_request_for(ds4_engine *e, server *s, const char *body,
+                                   int def_tokens, int ctx_size, request *r,
+                                   bool cache_probe, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
     r->model_syntax = server_model_syntax_for_engine(e);
     const char *p = body;
@@ -4170,7 +4176,8 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 free(key);
                 goto bad;
             }
-        } else if (!strcmp(key, "model")) {
+        } else if (!strcmp(key, "model") ||
+                   (cache_probe && !strcmp(key, "model_id"))) {
             if (!json_string_replace(&p, &r->model)) {
                 free(key);
                 goto bad;
@@ -4283,6 +4290,14 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
         request_free(r);
         return false;
     }
+    for (int i = 0; cache_probe && i < msgs.len; i++) {
+        if (msgs.v[i].images.len == 0) continue;
+        snprintf(err, errlen, "the cache probe does not take images");
+        chat_msgs_free(&msgs);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
@@ -4311,6 +4326,12 @@ bad:
     snprintf(err, errlen, "invalid JSON request");
     request_free(r);
     return false;
+}
+
+static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_tokens,
+                               int ctx_size, request *r, char *err, size_t errlen) {
+    return parse_chat_request_for(e, s, body, def_tokens, ctx_size, r, false,
+                                  err, errlen);
 }
 
 static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, int def_tokens,
@@ -10034,6 +10055,11 @@ struct server_slot {
     live_tool_state anthropic_live;
     visible_live_state thinking_live;
     int continued_last_store_tokens;
+    /* The X-Cache-Pin flag of the job whose state the slot holds: every store
+     * of that state (prefill boundaries, turn end, evict, shutdown) pins its
+     * entry.  generate_job_inner() takes the new job's flag only after the
+     * previous state's "evict" store. */
+    bool cache_pin;
     /* Wall time of the last completed job on this slot, stamped by the slot
      * worker; drives the staleness tiers in job_slot_score(). */
     time_t last_used;
@@ -11297,6 +11323,8 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
         return false;
     }
     pthread_mutex_lock(&s->kv_mu);
+    /* Every server store passes here: pin it when the slot's job asked. */
+    s->kv.pin_stores = slot->cache_pin;
     bool ok = ds4_kvstore_store_live_prefix_text(&s->kv, s->engine,
                                                   slot->session,
                                                   tokens, store_len, reason,
@@ -11304,6 +11332,7 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                                   cache_text_ext,
                                                   cache_text_key,
                                                   &hooks, err, sizeof(err));
+    s->kv.pin_stores = false;
     pthread_mutex_unlock(&s->kv_mu);
     pthread_mutex_unlock(&s->inference_mu);
     return ok;
@@ -13718,6 +13747,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
          * would silently discard the newer conversation state. */
         kv_cache_store_current(s, slot, "evict");
     }
+    /* From here on the slot's state is this job's: its stores pin by its
+     * flag.  The "evict" store above was the previous job's state. */
+    slot->cache_pin = j->req.cache_pin;
     if (!multimodal && cached == 0) {
         disk_cached = kv_cache_try_load(s, slot, &j->req, &effective_prompt,
                                         &disk_cache_path,
@@ -15057,6 +15089,9 @@ static job *dequeue(server *s) {
     job *j = s->head;
     s->head = j->next;
     if (!s->head) s->tail = NULL;
+    /* The single worker holds slot 0 until the job is done; the cache probe
+     * skips a busy slot as dispatch does in batched mode. */
+    s->slots[0].busy = true;
     pthread_mutex_unlock(&s->mu);
     j->next = NULL;
     return j;
@@ -15074,6 +15109,9 @@ static void *worker_main(void *arg) {
          * tiers read the slot's rendered-text cache and activity stamp. */
         slot_refresh_live_text(s, &s->slots[0]);
         s->slots[0].last_used = time(NULL);
+        pthread_mutex_lock(&s->mu);
+        s->slots[0].busy = false;
+        pthread_mutex_unlock(&s->mu);
     }
     return NULL;
 }
@@ -15117,6 +15155,7 @@ typedef struct {
     char path[256];
     char *body;
     size_t body_len;
+    bool cache_pin;     /* X-Cache-Pin: on */
 } http_request;
 
 static void http_request_free(http_request *r) {
@@ -15151,6 +15190,29 @@ static long content_length(const char *h, size_t n) {
     return 0;
 }
 
+/* True when the header name (with its colon, matched case-insensitively)
+ * carries value, compared case-insensitively without surrounding spaces. */
+static bool header_value_is(const char *h, size_t n, const char *name,
+                            const char *value) {
+    const size_t name_len = strlen(name), value_len = strlen(value);
+    const char *p = h, *end = h + n;
+    while (p < end) {
+        const char *line = p;
+        while (p < end && *p != '\n') p++;
+        size_t len = (size_t)(p - line);
+        if (len && line[len - 1] == '\r') len--;
+        if (len >= name_len && strncasecmp(line, name, name_len) == 0) {
+            const char *v = line + name_len, *vend = line + len;
+            while (v < vend && isspace((unsigned char)*v)) v++;
+            while (vend > v && isspace((unsigned char)vend[-1])) vend--;
+            if ((size_t)(vend - v) == value_len &&
+                strncasecmp(v, value, value_len) == 0) return true;
+        }
+        if (p < end) p++;
+    }
+    return false;
+}
+
 static bool read_http_request(int fd, http_request *r) {
     buf b = {0};
     ssize_t hend = -1;
@@ -15180,6 +15242,7 @@ static bool read_http_request(int fd, http_request *r) {
 
     long clen = content_length(b.ptr, (size_t)hend);
     if (clen < 0 || (size_t)clen > max_body) goto fail;
+    r->cache_pin = header_value_is(b.ptr, (size_t)hend, "X-Cache-Pin:", "on");
     while (b.len < (size_t)hend + (size_t)clen) {
         char tmp[8192];
         ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
@@ -15293,6 +15356,147 @@ static bool send_models(server *s, int fd) {
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
     return ok;
+}
+
+/* =========================================================================
+ * Cache admin routes: the pin set and the probe, in the shape the oMLX fork
+ * serves them so one client reads both servers.
+ * ========================================================================= */
+
+/* The figures of POST /admin/api/cache/probe.  The live tier is what dispatch
+ * would find: the best slot_probe_reuse_locked() over the resident slots no
+ * job holds, under tool_mu.  The disk tier is the entry the chat route would
+ * load when no live tier matched, and the count of every entry the prompt
+ * could restore, under kv_mu.  Nothing is loaded, no slot is touched, and
+ * inference_mu is never taken. */
+typedef struct {
+    int total_tokens;
+    int live_reuse_tokens;  /* best resident-slot reuse, 0 when none */
+    int ssd_hit_tokens;     /* longest stored prefix, whether or not used */
+    int block_size;         /* the continued-checkpoint interval */
+    int blocks_ssd_disk;    /* stored entries whose text prefixes the prompt */
+    int live_pinned_blocks; /* ... of which pinned */
+    int pinned_blocks_total;
+} cache_probe_figures;
+
+static void cache_probe_compute(server *s, const request *req,
+                                int model_id, int quant_bits,
+                                cache_probe_figures *f) {
+    memset(f, 0, sizeof(*f));
+    if (!s || !req) return;
+    f->total_tokens = req->prompt.len;
+
+    pthread_mutex_lock(&s->mu);
+    pthread_mutex_lock(&s->tool_mu);
+    for (int i = 0; i < s->slot_count; i++) {
+        server_slot *slot = &s->slots[i];
+        /* A held slot's state is changing under its worker, and dispatch
+         * would not offer it either. */
+        if (slot->busy || slot->assigned) continue;
+        const int reuse = slot_probe_reuse_locked(s, slot, req).reuse_tokens;
+        if (reuse > f->live_reuse_tokens) f->live_reuse_tokens = reuse;
+    }
+    pthread_mutex_unlock(&s->tool_mu);
+    pthread_mutex_unlock(&s->mu);
+
+    pthread_mutex_lock(&s->kv_mu);
+    /* Prefill chunks end on multiples of this interval (server_session_sync),
+     * so it is the spacing of the boundary checkpoints a prefill stores. */
+    f->block_size = ds4_kvstore_continued_interval(&s->kv);
+    f->pinned_blocks_total = ds4_kvstore_pinned_count(&s->kv);
+    if (s->kv.enabled && req->prompt_text &&
+        ds4_kvstore_quant_bits_supported(quant_bits))
+    {
+        const int idx = ds4_kvstore_find_text_prefix(&s->kv, req->prompt_text,
+                                                     model_id, quant_bits,
+                                                     s->ctx_size);
+        if (idx >= 0) f->ssd_hit_tokens = (int)s->kv.entry[idx].tokens;
+        f->blocks_ssd_disk = ds4_kvstore_count_text_prefixes(
+            &s->kv, req->prompt_text, model_id, quant_bits, s->ctx_size,
+            &f->live_pinned_blocks);
+    }
+    pthread_mutex_unlock(&s->kv_mu);
+}
+
+static void cache_probe_append_json(buf *b, const cache_probe_figures *f) {
+    /* The cached count the reply to the same request would carry: the live
+     * tier when one matched, else the disk entry the chat route loads. */
+    const int hit = f->live_reuse_tokens > 0 ? f->live_reuse_tokens
+                                             : f->ssd_hit_tokens;
+    const int cold = f->total_tokens > hit ? f->total_tokens - hit : 0;
+    const int hot = f->live_reuse_tokens > 0 ? 1 : 0;
+    const int blocks_cold = hit == f->total_tokens ? 0 : 1;
+    buf_printf(b,
+        "{\"model_loaded\":true,"
+        "\"total_tokens\":%d,"
+        "\"live_hit_tokens\":%d,"
+        "\"live_cold_tokens\":%d,"
+        "\"cold_tokens\":%d,"
+        "\"ssd_hit_tokens\":%d,"
+        "\"block_size\":%d,"
+        "\"blocks_ssd_hot\":%d,"
+        "\"blocks_ssd_disk\":%d,"
+        "\"blocks_cold\":%d,"
+        "\"total_blocks\":%d,"
+        "\"live_pinned_blocks\":%d,"
+        "\"live_tail_tokens\":0,"
+        "\"pinned_blocks_total\":%d}\n",
+        f->total_tokens, hit, cold, cold, f->ssd_hit_tokens, f->block_size,
+        hot, f->blocks_ssd_disk, blocks_cold,
+        hot + f->blocks_ssd_disk + blocks_cold,
+        f->live_pinned_blocks, f->pinned_blocks_total);
+}
+
+/* GET/DELETE /admin/api/cache/pins and POST /admin/api/cache/probe; any other
+ * /admin/api/ path is 404.  The server has no authentication, and neither do
+ * these routes. */
+static void handle_admin_request(server *s, int fd, const http_request *hr) {
+    const bool cors = s->enable_cors;
+    const bool get = !strcmp(hr->method, "GET");
+    if ((get || !strcmp(hr->method, "DELETE")) &&
+        !strcmp(hr->path, "/admin/api/cache/pins"))
+    {
+        buf b = {0};
+        pthread_mutex_lock(&s->kv_mu);
+        if (get) {
+            const int pinned = ds4_kvstore_pinned_count(&s->kv);
+            const uint64_t bytes = ds4_kvstore_pinned_bytes(&s->kv);
+            buf_printf(&b, "{\"pinned\":%d,\"pinned_bytes\":%llu}\n",
+                       pinned, (unsigned long long)bytes);
+        } else {
+            const int unpinned = ds4_kvstore_unpin_all(&s->kv);
+            buf_printf(&b, "{\"unpinned\":%d}\n", unpinned);
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: kv cache unpinned %d entries", unpinned);
+        }
+        pthread_mutex_unlock(&s->kv_mu);
+        http_response(fd, cors, 200, "application/json", b.ptr);
+        buf_free(&b);
+        return;
+    }
+    if (!strcmp(hr->method, "POST") &&
+        !strcmp(hr->path, "/admin/api/cache/probe"))
+    {
+        request req;
+        char err[160];
+        if (!parse_chat_request_for(s->engine, s, hr->body ? hr->body : "",
+                                    s->default_tokens, s->ctx_size, &req,
+                                    true, err, sizeof(err)))
+        {
+            http_error(fd, cors, 400, err);
+            return;
+        }
+        cache_probe_figures f;
+        cache_probe_compute(s, &req, ds4_engine_model_id(s->engine),
+                            ds4_engine_routed_quant_bits(s->engine), &f);
+        request_free(&req);
+        buf b = {0};
+        cache_probe_append_json(&b, &f);
+        http_response(fd, cors, 200, "application/json", b.ptr);
+        buf_free(&b);
+        return;
+    }
+    http_error(fd, cors, 404, "unknown endpoint");
 }
 
 static void client_done(server *s) {
@@ -15432,6 +15636,12 @@ static void *client_main(void *arg) {
         goto done;
     }
 
+    if (!strncmp(hr.path, "/admin/api/", strlen("/admin/api/"))) {
+        handle_admin_request(s, fd, &hr);
+        http_request_free(&hr);
+        goto done;
+    }
+
     request req;
     char err[160];
     bool ok = false;
@@ -15442,6 +15652,7 @@ static void *client_main(void *arg) {
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/chat/completions")) {
         ok = parse_chat_request(s->engine, s, hr.body, s->default_tokens,
                                 ctx_size, &req, err, sizeof(err));
+        if (ok) req.cache_pin = hr.cache_pin;
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/responses")) {
         ok = parse_responses_request(s->engine, s, hr.body, s->default_tokens,
                                      ctx_size, &req, err, sizeof(err));
@@ -22516,6 +22727,301 @@ static void test_kv_cache_eviction_keeps_aligned_continued_frontiers(void) {
     rmdir(dir);
 }
 
+static void test_kv_cache_remove_dir(const char *dir) {
+    DIR *d = opendir(dir);
+    if (d) {
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL) {
+            if (de->d_name[0] == '.') continue;
+            char *path = path_join(dir, de->d_name);
+            unlink(path);
+            free(path);
+        }
+        closedir(d);
+    }
+    rmdir(dir);
+}
+
+static bool test_kv_stub_exists(const char *dir, const char *sha) {
+    char name[44];
+    snprintf(name, sizeof(name), "%.40s.kv", sha);
+    char *path = path_join(dir, name);
+    bool exists = access(path, F_OK) == 0;
+    free(path);
+    return exists;
+}
+
+/* Pinned entries are never eviction victims: eviction takes the unpinned
+ * entry even when the pinned ones score lower, and when the pinned entries
+ * alone leave no room it evicts nothing and reports that the incoming file
+ * does not fit. */
+static void test_kv_cache_eviction_spares_pinned_entries(void) {
+    char tmpl[] = "/tmp/ds4-kv-pin-evict-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *pin_a = "1111111111111111111111111111111111111111";
+    const char *pin_b = "2222222222222222222222222222222222222222";
+    const char *loose = "3333333333333333333333333333333333333333";
+    const uint64_t now = (uint64_t)time(NULL);
+    const uint64_t file = KV_CACHE_FIXED_HEADER + 4u + 1024u;
+    /* The pinned entries would be the victims: few tokens, old, never hit. */
+    test_kv_stub_file(dir, pin_a, KV_REASON_COLD, 600, 0, now - 1000000, 1024);
+    test_kv_stub_file(dir, pin_b, KV_REASON_COLD, 600, 0, now - 1000000, 1024);
+    test_kv_stub_file(dir, loose, KV_REASON_COLD, 8192, 9, now, 1024);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    kc.budget_bytes = 3 * file + 16;
+    ds4_kvstore_pin(&kc, pin_a);
+    ds4_kvstore_pin(&kc, pin_b);
+    ds4_kvstore_pin(&kc, pin_a);
+    TEST_ASSERT(ds4_kvstore_pinned_count(&kc) == 2);
+    TEST_ASSERT(ds4_kvstore_pinned_bytes(&kc) == 2 * file);
+
+    TEST_ASSERT(ds4_kvstore_evict(&kc, NULL, file, NULL));
+    TEST_ASSERT(!test_kv_stub_exists(dir, loose));
+    TEST_ASSERT(test_kv_stub_exists(dir, pin_a));
+    TEST_ASSERT(test_kv_stub_exists(dir, pin_b));
+
+    /* When the pinned entries alone leave no room, the store will be
+     * skipped, so nothing unpinned is evicted for it either. */
+    const char *loose2 = "4444444444444444444444444444444444444444";
+    test_kv_stub_file(dir, loose2, KV_REASON_COLD, 8192, 9, now, 1024);
+    TEST_ASSERT(!ds4_kvstore_evict(&kc, NULL, 2 * file, NULL));
+    TEST_ASSERT(test_kv_stub_exists(dir, pin_a));
+    TEST_ASSERT(test_kv_stub_exists(dir, pin_b));
+    TEST_ASSERT(test_kv_stub_exists(dir, loose2));
+
+    /* The pins outlive the directory rescans each eviction made. */
+    TEST_ASSERT(ds4_kvstore_is_pinned(&kc, pin_a));
+    TEST_ASSERT(ds4_kvstore_is_pinned(&kc, pin_b));
+    TEST_ASSERT(!ds4_kvstore_is_pinned(&kc, loose));
+    TEST_ASSERT(ds4_kvstore_pinned_count(&kc) == 2);
+    TEST_ASSERT(ds4_kvstore_pinned_bytes(&kc) == 2 * file);
+
+    kv_cache_close(&kc);
+    test_kv_cache_remove_dir(dir);
+}
+
+static void test_kv_cache_unpin_all_releases_pins(void) {
+    char tmpl[] = "/tmp/ds4-kv-unpin-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *pin_a = "1111111111111111111111111111111111111111";
+    const char *pin_b = "2222222222222222222222222222222222222222";
+    const uint64_t now = (uint64_t)time(NULL);
+    const uint64_t file = KV_CACHE_FIXED_HEADER + 4u + 1024u;
+    test_kv_stub_file(dir, pin_a, KV_REASON_COLD, 600, 0, now, 1024);
+    test_kv_stub_file(dir, pin_b, KV_REASON_COLD, 600, 0, now, 1024);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    kc.budget_bytes = 2 * file + 16;
+    ds4_kvstore_pin(&kc, pin_a);
+    ds4_kvstore_pin(&kc, pin_b);
+    TEST_ASSERT(!ds4_kvstore_evict(&kc, NULL, file, NULL));
+
+    TEST_ASSERT(ds4_kvstore_unpin_all(&kc) == 2);
+    TEST_ASSERT(ds4_kvstore_pinned_count(&kc) == 0);
+    TEST_ASSERT(ds4_kvstore_pinned_bytes(&kc) == 0);
+    TEST_ASSERT(!ds4_kvstore_is_pinned(&kc, pin_a));
+    TEST_ASSERT(ds4_kvstore_unpin_all(&kc) == 0);
+
+    TEST_ASSERT(ds4_kvstore_evict(&kc, NULL, file, NULL));
+    TEST_ASSERT(test_kv_stub_exists(dir, pin_a) !=
+                test_kv_stub_exists(dir, pin_b));
+
+    kv_cache_close(&kc);
+    test_kv_cache_remove_dir(dir);
+}
+
+static void test_http_cache_pin_header(void) {
+    const char *on =
+        "POST /v1/chat/completions HTTP/1.1\r\nx-cache-pin:  on \r\n\r\n";
+    const char *off =
+        "POST /v1/chat/completions HTTP/1.1\r\nX-Cache-Pin: off\r\n\r\n";
+    const char *other =
+        "POST /v1/chat/completions HTTP/1.1\r\nX-Cache-Pinned: on\r\n\r\n";
+    TEST_ASSERT(header_value_is(on, strlen(on), "X-Cache-Pin:", "on"));
+    TEST_ASSERT(!header_value_is(off, strlen(off), "X-Cache-Pin:", "on"));
+    TEST_ASSERT(!header_value_is(other, strlen(other), "X-Cache-Pin:", "on"));
+
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    const char *wire =
+        "POST /v1/chat/completions HTTP/1.1\r\n"
+        "Content-Length: 2\r\n"
+        "X-Cache-Pin: on\r\n\r\n{}";
+    TEST_ASSERT(send_all(sv[0], wire, strlen(wire)));
+    http_request hr = {0};
+    TEST_ASSERT(read_http_request(sv[1], &hr));
+    TEST_ASSERT(hr.cache_pin);
+    TEST_ASSERT(hr.body && !strcmp(hr.body, "{}"));
+    http_request_free(&hr);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static char *test_admin_reply(server *s, const char *method, const char *path,
+                              const char *body) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    http_request hr = {0};
+    snprintf(hr.method, sizeof(hr.method), "%s", method);
+    snprintf(hr.path, sizeof(hr.path), "%s", path);
+    hr.body = (char *)body;
+    hr.body_len = body ? strlen(body) : 0;
+    handle_admin_request(s, sv[0], &hr);
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    close(sv[0]);
+    close(sv[1]);
+    return out;
+}
+
+/* The probe's figures over a synthetic store and a synthetic resident slot:
+ * the live tier wins when the slot's text prefixes the prompt, the disk
+ * entry when the slot is held, and the disk counts see every stored prefix
+ * and the pinned among them.  Then the pin routes over the same store. */
+static void test_cache_probe_figures_and_admin_routes(void) {
+    char tmpl[] = "/tmp/ds4-kv-probe-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *sys = "probe system";
+    const char *hist = "probe system and history";
+    const char *other = "probe other text";
+    test_kv_text_stub_file(dir, sys, KV_REASON_COLD, 600, 64);
+    test_kv_text_stub_file(dir, hist, KV_REASON_CONTINUED, 800, 64);
+    test_kv_text_stub_file(dir, other, KV_REASON_COLD, 700, 64);
+    char hist_sha[41];
+    sha1_bytes_hex(hist, strlen(hist), hist_sha);
+
+    server s;
+    test_cancel_server_init(&s);
+    pthread_mutex_init(&s.kv_mu, NULL);
+    s.ctx_size = 32768;
+    s.kv.enabled = true;
+    s.kv.dir = xstrdup(dir);
+    s.kv.opt = kv_cache_default_options();
+    s.kv.opt.continued_interval_tokens = 2048;
+    s.kv.opt.boundary_align_tokens = 2048;
+    ds4_kvstore_pin(&s.kv, hist_sha);
+
+    int live_tok[900];
+    for (int i = 0; i < 900; i++) live_tok[i] = i + 1;
+    server_slot slot = {0};
+    slot.srv = &s;
+    slot.session = ds4_session_new_test_checkpoint(live_tok, 900);
+    slot.live_text = (char *)"probe system and history and";
+    slot.live_text_len = strlen(slot.live_text);
+    slot.live_text_pos = 900;
+    s.slots = &slot;
+    s.slot_count = 1;
+
+    request req = {0};
+    req.kind = REQ_CHAT;
+    req.api = API_OPENAI;
+    for (int i = 0; i < 1000; i++) ds4_tokens_push(&req.prompt, 5000 + i);
+    req.prompt_text = (char *)"probe system and history and a new turn";
+
+    cache_probe_figures f;
+    cache_probe_compute(&s, &req, 0, 2, &f);
+    TEST_ASSERT(f.total_tokens == 1000);
+    TEST_ASSERT(f.live_reuse_tokens == 900);
+    TEST_ASSERT(f.ssd_hit_tokens == 800);
+    TEST_ASSERT(f.block_size == 2048);
+    TEST_ASSERT(f.blocks_ssd_disk == 2);
+    TEST_ASSERT(f.live_pinned_blocks == 1);
+    TEST_ASSERT(f.pinned_blocks_total == 1);
+    buf b = {0};
+    cache_probe_append_json(&b, &f);
+    TEST_ASSERT(strstr(b.ptr, "\"model_loaded\":true") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"live_hit_tokens\":900,") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"live_cold_tokens\":100,") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"cold_tokens\":100,") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"ssd_hit_tokens\":800,") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"blocks_ssd_hot\":1,") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"blocks_ssd_disk\":2,") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"blocks_cold\":1,") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"total_blocks\":4,") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"live_pinned_blocks\":1,") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"live_tail_tokens\":0,") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"pinned_blocks_total\":1}") != NULL);
+    buf_free(&b);
+
+    /* A held slot is not offered; the chat route would load the disk entry. */
+    slot.busy = true;
+    cache_probe_compute(&s, &req, 0, 2, &f);
+    TEST_ASSERT(f.live_reuse_tokens == 0);
+    TEST_ASSERT(f.ssd_hit_tokens == 800);
+    b = (buf){0};
+    cache_probe_append_json(&b, &f);
+    TEST_ASSERT(strstr(b.ptr, "\"live_hit_tokens\":800,") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"cold_tokens\":200,") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"blocks_ssd_hot\":0,") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"total_blocks\":3,") != NULL);
+    buf_free(&b);
+    slot.busy = false;
+
+    /* Entries of another quant are not offered when the store rejects them. */
+    s.kv.reject_different_quant = true;
+    cache_probe_compute(&s, &req, 0, 4, &f);
+    TEST_ASSERT(f.ssd_hit_tokens == 0);
+    TEST_ASSERT(f.blocks_ssd_disk == 0);
+    TEST_ASSERT(f.live_reuse_tokens == 900);
+    s.kv.reject_different_quant = false;
+
+    char want[96];
+    snprintf(want, sizeof(want), "{\"pinned\":1,\"pinned_bytes\":%llu}",
+             (unsigned long long)(KV_CACHE_FIXED_HEADER + 4u + strlen(hist) + 64u));
+    char *out = test_admin_reply(&s, "GET", "/admin/api/cache/pins", NULL);
+    TEST_ASSERT(strstr(out, "HTTP/1.1 200 OK") != NULL);
+    TEST_ASSERT(strstr(out, want) != NULL);
+    free(out);
+
+    out = test_admin_reply(&s, "POST", "/admin/api/cache/probe", "not json");
+    TEST_ASSERT(strstr(out, "HTTP/1.1 400 Bad Request") != NULL);
+    TEST_ASSERT(strstr(out, "invalid JSON request") != NULL);
+    free(out);
+    out = test_admin_reply(&s, "POST", "/admin/api/cache/probe",
+                           "{\"model_id\":\"deepseek-v4-flash\"}");
+    TEST_ASSERT(strstr(out, "HTTP/1.1 400 Bad Request") != NULL);
+    TEST_ASSERT(strstr(out, "missing messages") != NULL);
+    free(out);
+
+    out = test_admin_reply(&s, "GET", "/admin/api/cache/other", NULL);
+    TEST_ASSERT(strstr(out, "HTTP/1.1 404 Not Found") != NULL);
+    free(out);
+    out = test_admin_reply(&s, "POST", "/admin/api/cache/pins", "{}");
+    TEST_ASSERT(strstr(out, "HTTP/1.1 404 Not Found") != NULL);
+    free(out);
+
+    out = test_admin_reply(&s, "DELETE", "/admin/api/cache/pins", NULL);
+    TEST_ASSERT(strstr(out, "HTTP/1.1 200 OK") != NULL);
+    TEST_ASSERT(strstr(out, "{\"unpinned\":1}") != NULL);
+    free(out);
+    out = test_admin_reply(&s, "GET", "/admin/api/cache/pins", NULL);
+    TEST_ASSERT(strstr(out, "{\"pinned\":0,\"pinned_bytes\":0}") != NULL);
+    free(out);
+
+    ds4_session_free_test_checkpoint(slot.session);
+    ds4_tokens_free(&req.prompt);
+    kv_cache_close(&s.kv);
+    pthread_mutex_destroy(&s.kv_mu);
+    test_cancel_server_destroy(&s);
+    test_kv_cache_remove_dir(dir);
+}
+
 static void test_thinking_checkpoint_canonical_matches_future_prompt(void) {
     /* Simulate: user sends a single message, thinking mode on, no tools.
      * Model generates reasoning + content.  The next request will drop the
@@ -23418,6 +23924,10 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_score_decays_stale_hits();
     test_kv_cache_eviction_decayed_hits_tie_break_by_age();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();
+    test_kv_cache_eviction_spares_pinned_entries();
+    test_kv_cache_unpin_all_releases_pins();
+    test_http_cache_pin_header();
+    test_cache_probe_figures_and_admin_routes();
 }
 
 #ifndef DS4_SERVER_TEST_NO_MAIN

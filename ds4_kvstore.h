@@ -75,6 +75,14 @@ typedef struct {
     ds4_kvstore_entry *entry;
     int len;
     int cap;
+    /* Pinned entries, by sha: never chosen by eviction, for the life of the
+     * process.  Kept apart from entry[] so a rescan of the directory does not
+     * drop them.  While pin_stores is set, every entry a store writes, or
+     * finds already on disk, is pinned. */
+    char (*pin)[41];
+    int pin_len;
+    int pin_cap;
+    bool pin_stores;
     const char *log_name;
     void *log_ud;
     void (*log)(void *ud, ds4_kvstore_log_type type, const char *msg);
@@ -158,11 +166,28 @@ double ds4_kvstore_entry_eviction_score(const ds4_kvstore_entry *e,
                                         const ds4_tokens *live,
                                         uint64_t now,
                                         const ds4_kvstore_eviction_context *incoming);
-void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
+/* Never evicts a pinned entry.  Returns false, evicting nothing, when
+ * extra_bytes cannot fit beside the pinned entries (with nothing pinned:
+ * when it exceeds the budget). */
+bool ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
                        uint64_t extra_bytes,
                        const ds4_kvstore_eviction_context *incoming);
 int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
                                  int model_id, int quant_bits, int ctx_size);
+/* The number of entries find_text_prefix would accept for this prompt: each
+ * is a stored state the prompt could restore.  pinned_out, when given,
+ * receives how many of them are pinned. */
+int ds4_kvstore_count_text_prefixes(ds4_kvstore *kc, const char *prompt_text,
+                                    int model_id, int quant_bits, int ctx_size,
+                                    int *pinned_out);
+
+void ds4_kvstore_pin(ds4_kvstore *kc, const char sha[41]);
+bool ds4_kvstore_is_pinned(const ds4_kvstore *kc, const char sha[41]);
+/* Clears every pin; returns how many there were. */
+int ds4_kvstore_unpin_all(ds4_kvstore *kc);
+int ds4_kvstore_pinned_count(const ds4_kvstore *kc);
+/* The bytes on disk of the pinned entries present in the directory. */
+uint64_t ds4_kvstore_pinned_bytes(ds4_kvstore *kc);
 
 bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         ds4_engine *engine,
