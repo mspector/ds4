@@ -12474,6 +12474,19 @@ static int server_session_sync(server *s, server_slot *slot,
         int target = done + quantum;
         if (target > prompt->len || target < done) target = prompt->len;
         if (target <= 0) target = prompt->len;
+        /* End chunks on multiples of the continued-checkpoint interval, so
+         * the store that runs after each chunk writes a checkpoint at every
+         * boundary a long prefill crosses.  Without this, chunks end at the
+         * reused prefix plus the quantum and no boundary inside a prefill is
+         * ever stored, so a later prompt that diverges from this one finds
+         * nothing below its divergence but the chat anchor and prefills
+         * everything again; with it, the text-prefix tier restores the
+         * boundary below the divergence and prefills only what follows. */
+        const int step = ds4_kvstore_continued_interval(&s->kv);
+        if (step > 0 && target < prompt->len) {
+            const int aligned = target - target % step;
+            if (aligned > done) target = aligned;
+        }
 
         ds4_tokens prefix = *prompt;
         prefix.len = target;
