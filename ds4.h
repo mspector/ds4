@@ -485,6 +485,21 @@ void ds4_session_free_test_checkpoint(ds4_session *s);
  * token_start/row-count/fingerprint per span).  Not usable for inference. */
 void ds4_session_set_test_images(ds4_session *s,
                                  const ds4_vision_span *images, size_t n);
+/* Test helpers (ds4-test): the V4.1 packed checkpoint rows.  format 1 is a
+ * window row (FP8 E4M3, power-of-two scale per 32), 2 an indexer row (FP4 E2M1,
+ * power-of-two scale per 32), 3 a compressed KV row (FP4 E2M1, E4M3 scale per
+ * 16).  pack returns the raw block count and their floats in raw; unpack
+ * takes them back and returns the count it used.  span_roundtrip writes rows
+ * through the payload writer and reads them back in chunks of chunk_bytes. */
+uint64_t ds4_test_ds41_packed_row_bytes(int format, uint32_t width);
+uint64_t ds4_test_ds41_pack_rows(int format, uint32_t width, const float *x,
+                                 uint64_t rows, uint8_t *packed, float *raw);
+uint64_t ds4_test_ds41_unpack_rows(int format, uint32_t width, const uint8_t *packed,
+                                   uint64_t rows, const float *raw, float *x);
+int ds4_test_ds41_span_roundtrip(int format, uint32_t width, const float *x,
+                                 uint64_t rows, size_t chunk_bytes, float *out,
+                                 uint64_t *bytes, uint64_t *raw_blocks,
+                                 char *err, size_t errlen);
 int ds4_session_argmax(ds4_session *s);
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id);
 int ds4_session_argmax_ignoring_eos(ds4_session *s,

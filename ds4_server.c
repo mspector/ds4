@@ -22338,6 +22338,167 @@ static void test_kv_cache_lookup_rejects_stale_payload_abi(void) {
     rmdir(dir);
 }
 
+static uint32_t test_ds41_pack_rng(uint64_t *state) {
+    *state = *state * 6364136223846793005ull + 1442695040888963407ull;
+    return (uint32_t)(*state >> 33);
+}
+
+static float test_ds41_e4m3_value(uint32_t code) {
+    const uint32_t e = code >> 3 & 15u, m = code & 7u;
+    return e ? ldexpf((float)(8u + m), (int)e - 10) : ldexpf((float)m, -9);
+}
+
+/* Fills one block on the grid of format: codes (sign included) times a scale
+ * the encoder must find again.  kind 0 is random, 1 zeros of both signs, 2 the
+ * largest code of either sign beside random codes. */
+static void test_ds41_grid_block(int format, float *x, uint32_t n, int kind,
+                                 uint64_t *rng) {
+    static const float e2m1[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+    const float scale = format == 3 ?
+        test_ds41_e4m3_value(1u + test_ds41_pack_rng(rng) % 0x7eu) :
+        ldexpf(1.0f, (int)(test_ds41_pack_rng(rng) % 41u) - 30);
+    for (uint32_t i = 0; i < n; i++) {
+        const uint32_t r = test_ds41_pack_rng(rng);
+        uint32_t code = format == 1 ? r % 0x7fu : r % 8u;
+        if (kind == 1) code = 0;
+        if (kind == 2 && (i == 3 || i == n - 1)) code = format == 1 ? 0x7eu : 7u;
+        const float v = (format == 1 ? test_ds41_e4m3_value(code) : e2m1[code]) * scale;
+        x[i] = (r >> 20) & 1u ? -v : v;
+    }
+}
+
+static void test_ds41_fill_rows(int format, uint32_t width, float *x, uint64_t rows,
+                                uint64_t *rng, uint64_t raw_every, uint64_t *raw) {
+    const uint32_t n = format == 3 ? 16u : 32u;
+    const uint64_t blocks = rows * width / n;
+    *raw = 0;
+    for (uint64_t k = 0; k < blocks; k++) {
+        float *blk = x + k * n;
+        test_ds41_grid_block(format, blk, n, (int)(k % 3u), rng);
+        if (raw_every && k % raw_every == raw_every - 1u) {
+            /* off the grid: one value carries more mantissa than any code */
+            blk[k % n] = k % 2u ? 1.1f : -3.3e-3f;
+            if (k % (raw_every * 2u) == raw_every * 2u - 1u) {
+                const uint32_t nan_bits = 0x7fc00000u;
+                memcpy(&blk[0], &nan_bits, sizeof(float));
+            }
+            (*raw)++;
+        }
+    }
+}
+
+static void test_ds41_pack_rows_exact(void) {
+    static const struct { int format; uint32_t width; uint64_t row_bytes; } cases[] = {
+        {1, 512, 528}, {2, 128, 68}, {3, 512, 288},
+    };
+    uint64_t rng = 0x41;
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        const int format = cases[c].format;
+        const uint32_t width = cases[c].width;
+        const uint64_t rows = 9;
+        TEST_ASSERT(ds4_test_ds41_packed_row_bytes(format, width) == cases[c].row_bytes);
+        float *x = malloc(rows * width * sizeof(float));
+        float *raw = malloc(rows * width * sizeof(float));
+        float *y = malloc(rows * width * sizeof(float));
+        uint8_t *packed = malloc(rows * cases[c].row_bytes);
+        TEST_ASSERT(x && raw && y && packed);
+        if (!x || !raw || !y || !packed) {
+            free(x); free(raw); free(y); free(packed);
+            return;
+        }
+
+        uint64_t expect_raw = 0;
+        test_ds41_fill_rows(format, width, x, rows, &rng, 0, &expect_raw);
+        TEST_ASSERT(ds4_test_ds41_pack_rows(format, width, x, rows, packed, raw) == 0);
+        memset(y, 0xa5, rows * width * sizeof(float));
+        TEST_ASSERT(ds4_test_ds41_unpack_rows(format, width, packed, rows, raw, y) == 0);
+        TEST_ASSERT(memcmp(x, y, rows * width * sizeof(float)) == 0);
+
+        /* -0.0 comes back as -0.0 (bits, since fast-math ignores its sign) */
+        const uint32_t zero_bits[2] = {0u, 0x80000000u};
+        for (uint32_t i = 0; i < width; i++) memcpy(&x[i], &zero_bits[i % 2u], sizeof(float));
+        TEST_ASSERT(ds4_test_ds41_pack_rows(format, width, x, 1, packed, raw) == 0);
+        TEST_ASSERT(ds4_test_ds41_unpack_rows(format, width, packed, 1, raw, y) == 0);
+        uint32_t bits;
+        memcpy(&bits, &y[1], sizeof(bits));
+        TEST_ASSERT(bits == zero_bits[1]);
+        TEST_ASSERT(memcmp(x, y, width * sizeof(float)) == 0);
+
+        test_ds41_fill_rows(format, width, x, rows, &rng, 5, &expect_raw);
+        TEST_ASSERT(expect_raw > 0);
+        TEST_ASSERT(ds4_test_ds41_pack_rows(format, width, x, rows, packed, raw) == expect_raw);
+        memset(y, 0xa5, rows * width * sizeof(float));
+        TEST_ASSERT(ds4_test_ds41_unpack_rows(format, width, packed, rows, raw, y) == expect_raw);
+        TEST_ASSERT(memcmp(x, y, rows * width * sizeof(float)) == 0);
+
+        free(x);
+        free(raw);
+        free(y);
+        free(packed);
+    }
+
+    /* the largest values each grid holds, and one just past it */
+    float kv[16] = {0}, win[32] = {0}, idx[32] = {0};
+    uint8_t packed[528];
+    float raw[32], y[32];
+    kv[0] = 448.0f * 6.0f;
+    kv[1] = -448.0f * 6.0f;
+    TEST_ASSERT(ds4_test_ds41_pack_rows(3, 16, kv, 1, packed, raw) == 0);
+    TEST_ASSERT(ds4_test_ds41_unpack_rows(3, 16, packed, 1, raw, y) == 0 &&
+                memcmp(kv, y, sizeof(kv)) == 0);
+    win[0] = 448.0f;
+    win[1] = -ldexpf(1.0f, -9);
+    TEST_ASSERT(ds4_test_ds41_pack_rows(1, 32, win, 1, packed, raw) == 0);
+    TEST_ASSERT(ds4_test_ds41_unpack_rows(1, 32, packed, 1, raw, y) == 0 &&
+                memcmp(win, y, sizeof(win)) == 0);
+    win[2] = 480.0f;   /* forces scale 2, where 2^-9 falls off the grid */
+    TEST_ASSERT(ds4_test_ds41_pack_rows(1, 32, win, 1, packed, raw) == 1);
+    TEST_ASSERT(ds4_test_ds41_unpack_rows(1, 32, packed, 1, raw, y) == 1 &&
+                memcmp(win, y, sizeof(win)) == 0);
+    idx[0] = 6.0f;
+    idx[1] = -0.5f;
+    TEST_ASSERT(ds4_test_ds41_pack_rows(2, 32, idx, 1, packed, raw) == 0);
+    TEST_ASSERT(ds4_test_ds41_unpack_rows(2, 32, packed, 1, raw, y) == 0 &&
+                memcmp(idx, y, sizeof(idx)) == 0);
+    idx[2] = 0.25f;    /* 6 and 0.25 share no power-of-two scale */
+    TEST_ASSERT(ds4_test_ds41_pack_rows(2, 32, idx, 1, packed, raw) == 1);
+    TEST_ASSERT(ds4_test_ds41_unpack_rows(2, 32, packed, 1, raw, y) == 1 &&
+                memcmp(idx, y, sizeof(idx)) == 0);
+}
+
+static void test_ds41_pack_span_roundtrip(void) {
+    static const struct { int format; uint32_t width; } cases[] = {{1, 512}, {2, 128}, {3, 512}};
+    uint64_t rng = 0x5041;
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        const int format = cases[c].format;
+        const uint32_t width = cases[c].width;
+        const uint32_t n = format == 3 ? 16u : 32u;
+        const uint64_t rows = 301;
+        float *x = malloc(rows * width * sizeof(float));
+        float *y = malloc(rows * width * sizeof(float));
+        TEST_ASSERT(x && y);
+        if (!x || !y) {
+            free(x); free(y);
+            return;
+        }
+        uint64_t expect_raw = 0, bytes = 0, raw_blocks = 0;
+        test_ds41_fill_rows(format, width, x, rows, &rng, 97, &expect_raw);
+        memset(y, 0xa5, rows * width * sizeof(float));
+        char err[128] = {0};
+        /* seven rows a chunk: the last chunk is short and raw blocks span chunks */
+        TEST_ASSERT(ds4_test_ds41_span_roundtrip(format, width, x, rows,
+                                                 7u * width * sizeof(float), y,
+                                                 &bytes, &raw_blocks,
+                                                 err, sizeof(err)) == 0);
+        TEST_ASSERT(raw_blocks == expect_raw);
+        TEST_ASSERT(bytes == rows * ds4_test_ds41_packed_row_bytes(format, width) +
+                             expect_raw * n * sizeof(float));
+        TEST_ASSERT(memcmp(x, y, rows * width * sizeof(float)) == 0);
+        free(x);
+        free(y);
+    }
+}
+
 static void test_kv_tool_map_filters_by_dsml_text(void) {
     const char *dsml_keep =
         "\n\n<｜DSML｜tool_calls>\n"
@@ -24053,6 +24214,8 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_text_key_ignores_line_trailing_space();
     test_kv_cache_lookup_rejects_wrong_model();
     test_kv_cache_lookup_rejects_stale_payload_abi();
+    test_ds41_pack_rows_exact();
+    test_ds41_pack_span_roundtrip();
     test_kv_cache_eviction_values_fresh_snapshots();
     test_kv_cache_eviction_prefers_anchor_reason();
     test_kv_cache_eviction_makes_room_before_store();

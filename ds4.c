@@ -65232,10 +65232,432 @@ static void session_greedy_splitkv_reset(ds4_session *s) {
 }
 #endif
 
+/* V4.1 checkpoint rows sit on the grids kernel_dsv41_quantize rounds them to
+ * (metal/dsv41.metal): window rows are FP8 E4M3 with a power-of-two scale per
+ * 32 values, indexer keys FP4 E2M1 with a power-of-two scale per 32, compressed
+ * KV FP4 E2M1 with an E4M3 scale per 16.  A packed row is its codes followed by
+ * one scale byte per block.  A block is packed only if its codes decode to
+ * every one of its f32 bits; otherwise its scale byte is DS41_PACK_RAW and its
+ * floats follow the span, so a restore is bit-identical whatever the rows
+ * hold.  Codes are matched on f32 bits, never found by division, so fast-math
+ * cannot change what is stored. */
+enum {
+    DS41_PACK_F32 = 0,
+    DS41_PACK_FP8_POW2 = 1,   /* DS4_V41_FP8_E8M0 */
+    DS41_PACK_FP4_POW2 = 2,   /* DS4_V41_FP4_E8M0 */
+    DS41_PACK_FP4_E4M3 = 3,   /* DS4_V41_FP4_E4M3 */
+};
+#define DS41_PACK_RAW 0xffu
+
+static const float ds41_e2m1[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+
+static uint32_t ds41_pack_block(uint32_t format) {
+    return format == DS41_PACK_FP4_E4M3 ? 16u : 32u;
+}
+
+static uint32_t ds41_pack_code_bytes(uint32_t format) {
+    return format == DS41_PACK_FP8_POW2 ? 32u : ds41_pack_block(format) / 2u;
+}
+
+static uint64_t ds41_packed_row_bytes(uint32_t format, uint32_t width) {
+    if (format == DS41_PACK_F32) return (uint64_t)width * sizeof(float);
+    const uint32_t blocks = width / ds41_pack_block(format);
+    return (uint64_t)blocks * (ds41_pack_code_bytes(format) + 1u);
+}
+
+static uint32_t ds41_f32_bits(float x) {
+    uint32_t u;
+    memcpy(&u, &x, sizeof(u));
+    return u;
+}
+
+static float ds41_bits_f32(uint32_t u) {
+    float x;
+    memcpy(&x, &u, sizeof(x));
+    return x;
+}
+
+/* E4M3FN magnitudes by code; 0x7f is NaN and never stored. */
+static void ds41_e4m3_table(float t[128]) {
+    for (uint32_t c = 0; c < 128; c++) {
+        const uint32_t e = c >> 3, m = c & 7u;
+        t[c] = e ? ldexpf((float)(8u + m), (int)e - 10) : ldexpf((float)m, -9);
+    }
+}
+
+/* The E4M3FN code of a magnitude given as f32 bits, or -1 if it has none. */
+static int ds41_pack_e4m3_code(uint32_t a) {
+    if (a == 0) return 0;
+    const int e = (int)(a >> 23) - 127;
+    const uint32_t m = a & 0x7fffffu;
+    if ((a >> 23) == 0 || e > 8 || e < -9) return -1;
+    if (e >= -6) {
+        const uint32_t code = (uint32_t)(e + 7) << 3 | m >> 20;
+        return (m & 0xfffffu) || code == 0x7fu ? -1 : (int)code;
+    }
+    const uint32_t sig = 0x800000u | m, shift = (uint32_t)(14 - e);
+    return sig & ((1u << shift) - 1u) ? -1 : (int)(sig >> shift);
+}
+
+static float ds41_pack_scale(uint32_t format, uint32_t byte, const float e4m3[128]) {
+    return format == DS41_PACK_FP4_E4M3 ? e4m3[byte & 0x7fu] : ds41_bits_f32(byte << 23);
+}
+
+/* FP4 codes of a block under scale s, true if each value is code times s. */
+static bool ds41_fp4_codes(const uint32_t *b, uint32_t n, float s, uint8_t *codes) {
+    uint32_t p[8];
+    for (uint32_t j = 0; j < 8; j++) p[j] = ds41_f32_bits(ds41_e2m1[j] * s);
+    if (p[1] < 0x800000u || p[7] >= 0x7f800000u) return false;
+    uint32_t bad = 0;
+    for (uint32_t i = 0; i < n; i += 2) {
+        uint32_t c[2];
+        for (uint32_t h = 0; h < 2; h++) {
+            const uint32_t a = b[i + h] & 0x7fffffffu;
+            uint32_t k = 8;
+            for (uint32_t j = 0; j < 8; j++) k = a == p[j] ? j : k;
+            bad |= k >> 3;
+            c[h] = (k & 7u) | (b[i + h] >> 28 & 8u);
+        }
+        codes[i / 2u] = (uint8_t)(c[0] | c[1] << 4);
+    }
+    return bad == 0;
+}
+
+/* FP8 codes of a block under scale 2^(kb-127), true if each value decodes. */
+static bool ds41_fp8_codes(const uint32_t *b, uint32_t n, uint32_t kb,
+                           const float e4m3[128], uint8_t *codes) {
+    const float s = ds41_bits_f32(kb << 23);
+    const int shift = (int)kb - 127;
+    bool ok = true;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint32_t a = b[i] & 0x7fffffffu;
+        int code = 0;
+        if (a) {
+            /* a / 2^shift, by its exponent bits */
+            const int eq = (int)(a >> 23) - shift;
+            code = (a >> 23) && eq >= 1 && eq <= 254 ?
+                ds41_pack_e4m3_code((uint32_t)eq << 23 | (a & 0x7fffffu)) : -1;
+            if (code < 0 || ds41_f32_bits(e4m3[code] * s) != a) {
+                ok = false;
+                code = 0;
+            }
+        }
+        codes[i] = (uint8_t)((uint32_t)code | (b[i] >> 24 & 0x80u));
+    }
+    return ok;
+}
+
+/* Packs one block, returning its scale byte or DS41_PACK_RAW. */
+static uint32_t ds41_pack_one(uint32_t format, const float *x,
+                              const float e4m3[128], uint8_t *codes) {
+    const uint32_t n = ds41_pack_block(format);
+    uint32_t b[32], amax = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        b[i] = ds41_f32_bits(x[i]);
+        const uint32_t a = b[i] & 0x7fffffffu;
+        amax = a > amax ? a : amax;
+    }
+    if (amax >= 0x7f800000u) return DS41_PACK_RAW;
+    if (format == DS41_PACK_FP4_E4M3) {
+        if (!amax) return ds41_fp4_codes(b, n, e4m3[1], codes) ? 1u : DS41_PACK_RAW;
+        static const float top[7] = {6.0f, 4.0f, 3.0f, 2.0f, 1.5f, 1.0f, 0.5f};
+        for (uint32_t j = 0; j < 7; j++) {
+            /* The quotient is a guess; rounded to three mantissa bits it is
+             * the E4M3 scale if one exists, and the codes verify it. */
+            const uint32_t guess =
+                (ds41_f32_bits(ds41_bits_f32(amax) / top[j]) + 0x80000u) & 0xfff00000u;
+            const int sc = ds41_pack_e4m3_code(guess);
+            if (sc > 0 && ds41_fp4_codes(b, n, e4m3[sc], codes)) return (uint32_t)sc;
+        }
+        return DS41_PACK_RAW;
+    }
+    /* Lowering a power-of-two scale keeps every code on the grid until the
+     * block maximum overflows it, so the smallest scale that holds the maximum
+     * (6 = 1.5*2^2, 448 = 1.75*2^8) works whenever any scale does. */
+    const uint32_t eb = amax >> 23, m = amax & 0x7fffffu;
+    const int kb = !amax ? 127 :
+        format == DS41_PACK_FP8_POW2 ? (int)eb - (m <= 0x600000u ? 8 : 7) :
+                                       (int)eb - (m <= 0x400000u ? 2 : 1);
+    if ((amax && !eb) || kb < 1 || kb > 254) return DS41_PACK_RAW;
+    const bool ok = format == DS41_PACK_FP8_POW2 ?
+        ds41_fp8_codes(b, n, (uint32_t)kb, e4m3, codes) :
+        ds41_fp4_codes(b, n, ds41_bits_f32((uint32_t)kb << 23), codes);
+    return ok ? (uint32_t)kb : DS41_PACK_RAW;
+}
+
+/* Packs rows of width floats, each row its codes then its scale bytes.  The
+ * floats of raw blocks go to raw in order (raw may be x: a block only moves
+ * toward the front); returns their count. */
+static uint64_t ds41_pack_rows(uint32_t format, uint32_t width, const float *x,
+                               uint64_t rows, uint8_t *dst, float *raw) {
+    const uint32_t n = ds41_pack_block(format), nb = width / n;
+    const uint32_t code_bytes = ds41_pack_code_bytes(format);
+    const uint64_t row_bytes = ds41_packed_row_bytes(format, width);
+    float e4m3[128];
+    ds41_e4m3_table(e4m3);
+    uint64_t nraw = 0;
+    for (uint64_t r = 0; r < rows; r++) {
+        uint8_t *row = dst + r * row_bytes;
+        for (uint32_t k = 0; k < nb; k++) {
+            const float *blk = x + (r * nb + k) * n;
+            uint8_t *codes = row + (uint64_t)k * code_bytes;
+            const uint32_t scale = ds41_pack_one(format, blk, e4m3, codes);
+            row[(uint64_t)nb * code_bytes + k] = (uint8_t)scale;
+            if (scale == DS41_PACK_RAW) {
+                memset(codes, 0, code_bytes);
+                memmove(raw + nraw * n, blk, n * sizeof(float));
+                nraw++;
+            }
+        }
+    }
+    return nraw;
+}
+
+typedef struct {
+    uint64_t *v;
+    uint64_t len, cap;
+} ds41_block_list;
+
+/* Decodes packed rows into x.  A raw block is zeroed and its index, counted
+ * from first_block, appended to raw_blocks. */
+static void ds41_unpack_rows(uint32_t format, uint32_t width, const uint8_t *src,
+                             uint64_t rows, float *x, uint64_t first_block,
+                             ds41_block_list *raw_blocks) {
+    const uint32_t n = ds41_pack_block(format), nb = width / n;
+    const uint32_t code_bytes = ds41_pack_code_bytes(format);
+    const uint64_t row_bytes = ds41_packed_row_bytes(format, width);
+    float e4m3[128];
+    ds41_e4m3_table(e4m3);
+    for (uint64_t r = 0; r < rows; r++) {
+        const uint8_t *row = src + r * row_bytes;
+        for (uint32_t k = 0; k < nb; k++) {
+            const uint8_t *codes = row + (uint64_t)k * code_bytes;
+            const uint32_t scale = row[(uint64_t)nb * code_bytes + k];
+            float *blk = x + (r * nb + k) * n;
+            if (scale == DS41_PACK_RAW) {
+                memset(blk, 0, n * sizeof(float));
+                if (raw_blocks->len == raw_blocks->cap) {
+                    raw_blocks->cap = raw_blocks->cap ? raw_blocks->cap * 2u : 64u;
+                    raw_blocks->v = xrealloc(raw_blocks->v, raw_blocks->cap * sizeof(uint64_t));
+                }
+                raw_blocks->v[raw_blocks->len++] = first_block + r * nb + k;
+                continue;
+            }
+            const float s = ds41_pack_scale(format, scale, e4m3);
+            if (format == DS41_PACK_FP8_POW2) {
+                for (uint32_t i = 0; i < n; i++) {
+                    const uint32_t c = codes[i];
+                    blk[i] = ds41_bits_f32(ds41_f32_bits(e4m3[c & 0x7fu] * s) |
+                                           (c & 0x80u) << 24);
+                }
+            } else {
+                uint32_t p[8];
+                for (uint32_t j = 0; j < 8; j++) p[j] = ds41_f32_bits(ds41_e2m1[j] * s);
+                for (uint32_t i = 0; i < n; i++) {
+                    const uint32_t c = (uint32_t)codes[i / 2u] >> (i & 1u) * 4u & 15u;
+                    blk[i] = ds41_bits_f32(p[c & 7u] | (c & 8u) << 28);
+                }
+            }
+        }
+    }
+}
+
+/* Packed spans stream between the payload and either device or host rows. */
+typedef struct {
+    struct ds4_gpu_tensor *tensor;
+    float *host;
+} ds41_rows;
+
+typedef struct {
+    uint64_t packed, f32, raw_blocks;
+} ds41_pack_stats;
+
+static int ds41_rows_read(const ds41_rows *r, uint64_t off, void *dst, uint64_t bytes) {
+    if (r->host) {
+        memcpy(dst, (const uint8_t *)r->host + off, (size_t)bytes);
+        return 1;
+    }
+#ifndef DS4_NO_GPU
+    return r->tensor && off <= ds4_gpu_tensor_bytes(r->tensor) &&
+           bytes <= ds4_gpu_tensor_bytes(r->tensor) - off &&
+           ds4_gpu_tensor_read(r->tensor, off, dst, bytes);
+#else
+    return 0;
+#endif
+}
+
+static int ds41_rows_write(const ds41_rows *r, uint64_t off, const void *src, uint64_t bytes) {
+    if (r->host) {
+        memcpy((uint8_t *)r->host + off, src, (size_t)bytes);
+        return 1;
+    }
+#ifndef DS4_NO_GPU
+    return r->tensor && off <= ds4_gpu_tensor_bytes(r->tensor) &&
+           bytes <= ds4_gpu_tensor_bytes(r->tensor) - off &&
+           ds4_gpu_tensor_write(r->tensor, off, src, bytes);
+#else
+    return 0;
+#endif
+}
+
+/* Writes rows as packed rows, then the floats of their raw blocks.  With fp
+ * NULL it only measures them.  fbuf and pbuf hold cap bytes, at least a row. */
+static int ds41_write_packed_rows(FILE *fp, const ds41_rows *src, uint32_t format,
+                                  uint32_t width, uint64_t rows,
+                                  float *fbuf, uint8_t *pbuf, size_t cap,
+                                  ds41_pack_stats *st, char *err, size_t errlen) {
+    const uint32_t n = ds41_pack_block(format);
+    const uint64_t row_f32 = (uint64_t)width * sizeof(float);
+    const uint64_t row_bytes = ds41_packed_row_bytes(format, width);
+    const uint64_t chunk = cap / row_f32;
+    float *raw = NULL;
+    uint64_t nraw = 0, raw_cap = 0;
+    int rc = 0;
+    for (uint64_t r = 0; r < rows && !rc; r += chunk) {
+        const uint64_t m = rows - r < chunk ? rows - r : chunk;
+        if (!ds41_rows_read(src, r * row_f32, fbuf, m * row_f32)) {
+            payload_set_err(err, errlen, "failed to read V4.1 session rows");
+            rc = 1;
+            break;
+        }
+        const uint64_t k = ds41_pack_rows(format, width, fbuf, m, pbuf, fbuf);
+        if (k && fp) {
+            if (nraw + k > raw_cap) {
+                raw_cap = (nraw + k) * 2u;
+                raw = xrealloc(raw, (size_t)(raw_cap * n * sizeof(float)));
+            }
+            memcpy(raw + nraw * n, fbuf, (size_t)(k * n * sizeof(float)));
+        }
+        nraw += k;
+        if (fp) rc = payload_write_bytes(fp, pbuf, m * row_bytes, err, errlen);
+    }
+    if (!rc && fp && nraw)
+        rc = payload_write_bytes(fp, raw, nraw * n * sizeof(float), err, errlen);
+    free(raw);
+    if (!rc && st) {
+        st->packed += rows * row_bytes + nraw * n * sizeof(float);
+        st->f32 += rows * row_f32;
+        st->raw_blocks += nraw;
+    }
+    return rc;
+}
+
+static int ds41_read_packed_rows(FILE *fp, const ds41_rows *dst, uint32_t format,
+                                 uint32_t width, uint64_t rows,
+                                 float *fbuf, uint8_t *pbuf, size_t cap,
+                                 uint64_t *remaining, ds41_pack_stats *st,
+                                 char *err, size_t errlen) {
+    const uint32_t n = ds41_pack_block(format), nb = width / n;
+    const uint64_t row_f32 = (uint64_t)width * sizeof(float);
+    const uint64_t row_bytes = ds41_packed_row_bytes(format, width);
+    const uint64_t chunk = cap / row_f32;
+    ds41_block_list raw = {0};
+    int rc = 0;
+    for (uint64_t r = 0; r < rows && !rc; r += chunk) {
+        const uint64_t m = rows - r < chunk ? rows - r : chunk;
+        rc = payload_read_bytes(fp, pbuf, m * row_bytes, remaining, err, errlen);
+        if (rc) break;
+        ds41_unpack_rows(format, width, pbuf, m, fbuf, r * nb, &raw);
+        if (!ds41_rows_write(dst, r * row_f32, fbuf, m * row_f32)) {
+            payload_set_err(err, errlen, "failed to restore V4.1 session rows");
+            rc = 1;
+        }
+    }
+    for (uint64_t i = 0; i < raw.len && !rc; i++) {
+        rc = payload_read_bytes(fp, fbuf, n * sizeof(float), remaining, err, errlen);
+        if (!rc && !ds41_rows_write(dst, raw.v[i] * n * sizeof(float), fbuf,
+                                    n * sizeof(float))) {
+            payload_set_err(err, errlen, "failed to restore V4.1 session rows");
+            rc = 1;
+        }
+    }
+    if (!rc && st) {
+        st->packed += rows * row_bytes + raw.len * n * sizeof(float);
+        st->f32 += rows * row_f32;
+        st->raw_blocks += raw.len;
+    }
+    free(raw.v);
+    return rc;
+}
+
+uint64_t ds4_test_ds41_packed_row_bytes(int format, uint32_t width) {
+    return ds41_packed_row_bytes((uint32_t)format, width);
+}
+
+uint64_t ds4_test_ds41_pack_rows(int format, uint32_t width, const float *x,
+                                 uint64_t rows, uint8_t *packed, float *raw) {
+    return ds41_pack_rows((uint32_t)format, width, x, rows, packed, raw);
+}
+
+uint64_t ds4_test_ds41_unpack_rows(int format, uint32_t width, const uint8_t *packed,
+                                   uint64_t rows, const float *raw, float *x) {
+    const uint32_t n = ds41_pack_block((uint32_t)format);
+    ds41_block_list list = {0};
+    ds41_unpack_rows((uint32_t)format, width, packed, rows, x, 0, &list);
+    for (uint64_t i = 0; i < list.len; i++)
+        memcpy(x + list.v[i] * n, raw + i * n, n * sizeof(float));
+    const uint64_t len = list.len;
+    free(list.v);
+    return len;
+}
+
+int ds4_test_ds41_span_roundtrip(int format, uint32_t width, const float *x,
+                                 uint64_t rows, size_t chunk_bytes, float *out,
+                                 uint64_t *bytes, uint64_t *raw_blocks,
+                                 char *err, size_t errlen) {
+    if (chunk_bytes < (size_t)width * sizeof(float)) {
+        payload_set_err(err, errlen, "span chunk is smaller than a row");
+        return 1;
+    }
+    FILE *fp = tmpfile();
+    if (!fp) {
+        payload_set_err(err, errlen, "failed to open span temporary file");
+        return 1;
+    }
+    const ds41_rows src = {NULL, (float *)x}, dst = {NULL, out};
+    float *fbuf = xmalloc(chunk_bytes);
+    uint8_t *pbuf = xmalloc(chunk_bytes);
+    ds41_pack_stats measured = {0}, written = {0}, read = {0};
+    int rc = ds41_write_packed_rows(NULL, &src, (uint32_t)format, width, rows,
+                                    fbuf, pbuf, chunk_bytes, &measured, err, errlen) ||
+             ds41_write_packed_rows(fp, &src, (uint32_t)format, width, rows,
+                                    fbuf, pbuf, chunk_bytes, &written, err, errlen);
+    const long size = rc ? -1 : ftell(fp);
+    if (!rc && (size < 0 || (uint64_t)size != written.packed ||
+                measured.packed != written.packed)) {
+        payload_set_err(err, errlen, "packed span size differs from its measure");
+        rc = 1;
+    }
+    uint64_t remaining = rc ? 0 : (uint64_t)size;
+    if (!rc && fseek(fp, 0, SEEK_SET) != 0) {
+        payload_set_err(err, errlen, "failed to rewind span temporary file");
+        rc = 1;
+    }
+    if (!rc) rc = ds41_read_packed_rows(fp, &dst, (uint32_t)format, width, rows,
+                                        fbuf, pbuf, chunk_bytes, &remaining, &read,
+                                        err, errlen);
+    if (!rc && (remaining != 0 || read.raw_blocks != written.raw_blocks)) {
+        payload_set_err(err, errlen, "packed span read back a different layout");
+        rc = 1;
+    }
+    if (bytes) *bytes = written.packed;
+    if (raw_blocks) *raw_blocks = written.raw_blocks;
+    free(fbuf);
+    free(pbuf);
+    fclose(fp);
+    return rc;
+}
+
 #ifdef DS4_HAS_DEEPSEEK41_GPU
+/* h[12] of a V4.1 payload: "14P", state rows packed on their quantization
+ * grids.  Payloads of f32 rows ("14A") are no longer read. */
+#define DS41_PAYLOAD_TAG 0x503431u
+
 typedef struct {
     ds4_gpu_tensor *tensor;
-    uint64_t bytes;
+    uint64_t rows;
+    uint32_t width;
+    uint32_t format;
 } ds41_state_span;
 
 /* The selection masks are rebuilt by each index-source layer on the next
@@ -65245,25 +65667,56 @@ static uint32_t ds41_state_spans(ds41_gpu_graph *g, uint32_t pos,
     uint32_t n = 0;
     const uint32_t raw = pos < 128u ? pos : 128u;
     for (uint32_t il = 0; il < 40; il++)
-        spans[n++] = (ds41_state_span){g->window[il], (uint64_t)raw * 512u * 4u};
+        spans[n++] = (ds41_state_span){g->window[il], raw, 512, DS41_PACK_FP8_POW2};
     for (uint32_t i = 0; i < 4; i++) {
         const uint32_t live = pos / (i < 3 ? 2u : 1u);
-        spans[n++] = (ds41_state_span){g->compressed[i], (uint64_t)live * 512u * 4u};
-        spans[n++] = (ds41_state_span){g->index_cache[i], (uint64_t)live * 128u * 4u};
+        spans[n++] = (ds41_state_span){g->compressed[i], live, 512, DS41_PACK_FP4_E4M3};
+        spans[n++] = (ds41_state_span){g->index_cache[i], live, 128, DS41_PACK_FP4_POW2};
         if (i < 3 && (pos & 1u)) {
-            spans[n++] = (ds41_state_span){g->previous_kv[i], 512u * 4u};
-            spans[n++] = (ds41_state_span){g->previous_score[i], 512u * 4u};
+            spans[n++] = (ds41_state_span){g->previous_kv[i], 1, 512, DS41_PACK_F32};
+            spans[n++] = (ds41_state_span){g->previous_score[i], 1, 512, DS41_PACK_F32};
         }
     }
     return n;
 }
 
+/* The body with every block packed; each raw block adds its floats. */
 static uint64_t ds41_payload_body_bytes(ds41_gpu_graph *g, uint32_t pos) {
     ds41_state_span spans[54];
     const uint32_t n = ds41_state_spans(g, pos, spans);
     uint64_t bytes = ((uint64_t)pos + DS4_N_VOCAB) * sizeof(float);
-    for (uint32_t i = 0; i < n; i++) bytes += spans[i].bytes;
+    for (uint32_t i = 0; i < n; i++)
+        bytes += spans[i].rows * ds41_packed_row_bytes(spans[i].format, spans[i].width);
     return bytes;
+}
+
+/* Writes the state spans after the logits, or with fp NULL only measures them. */
+static int ds41_write_state(ds41_gpu_graph *g, uint32_t pos, FILE *fp,
+                            ds41_pack_stats *st, char *err, size_t errlen) {
+    ds41_state_span spans[54];
+    const uint32_t n = ds41_state_spans(g, pos, spans);
+    float *fbuf = xmalloc(DS4_SESSION_IO_CHUNK);
+    uint8_t *pbuf = xmalloc(DS4_SESSION_IO_CHUNK);
+    int rc = 0;
+    for (uint32_t i = 0; i < n && !rc; i++) {
+        const uint64_t bytes = spans[i].rows * spans[i].width * sizeof(float);
+        if (spans[i].format != DS41_PACK_F32) {
+            const ds41_rows src = {spans[i].tensor, NULL};
+            rc = ds41_write_packed_rows(fp, &src, spans[i].format, spans[i].width,
+                                        spans[i].rows, fbuf, pbuf, DS4_SESSION_IO_CHUNK,
+                                        st, err, errlen);
+        } else {
+            if (fp) rc = payload_write_tensor_span(fp, spans[i].tensor, 0, bytes,
+                                                   pbuf, DS4_SESSION_IO_CHUNK, err, errlen);
+            if (!rc) {
+                st->packed += bytes;
+                st->f32 += bytes;
+            }
+        }
+    }
+    free(fbuf);
+    free(pbuf);
+    return rc;
 }
 
 static int ds41_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
@@ -65275,21 +65728,22 @@ static int ds41_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
     }
     const uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS] = {
         DS4_SESSION_PAYLOAD_MAGIC, DS4_SESSION_PAYLOAD_VERSION,
-        g->ctx, 1, 128, 128, g->ctx + 1u, g->pos, 40, 512, 128, DS4_N_VOCAB, 0x413431u
+        g->ctx, 1, 128, 128, g->ctx + 1u, g->pos, 40, 512, 128, DS4_N_VOCAB, DS41_PAYLOAD_TAG
     };
     for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++)
         if (payload_write_u32(fp, h[i], err, errlen)) return 1;
     for (int i = 0; i < s->checkpoint.len; i++)
         if (payload_write_u32(fp, (uint32_t)s->checkpoint.v[i], err, errlen)) return 1;
     if (payload_write_bytes(fp, s->logits, (uint64_t)DS4_N_VOCAB * 4u, err, errlen)) return 1;
-    ds41_state_span spans[54];
-    const uint32_t n = ds41_state_spans(g, g->pos, spans);
-    uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
-    int rc = 0;
-    for (uint32_t i = 0; i < n && !rc; i++)
-        rc = payload_write_tensor_span(fp, spans[i].tensor, 0, spans[i].bytes,
-                                        buf, DS4_SESSION_IO_CHUNK, err, errlen);
-    free(buf);
+    const double t0 = now_sec();
+    ds41_pack_stats st = {0};
+    const int rc = ds41_write_state(g, g->pos, fp, &st, err, errlen);
+    if (!rc)
+        ds4_log(stderr, DS4_LOG_KVCACHE,
+                "ds4: V4.1 state packed tokens=%u packed=%.2f MiB f32=%.2f MiB raw_blocks=%llu encode=%.1f ms\n",
+                g->pos, (double)st.packed / (1024.0 * 1024.0),
+                (double)st.f32 / (1024.0 * 1024.0),
+                (unsigned long long)st.raw_blocks, (now_sec() - t0) * 1000.0);
     return rc;
 }
 
@@ -65300,7 +65754,7 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
     if (!s->ds41_graph_ready || !pos || pos >= g->ctx || pos >= h[2] || h[2] > 1048576u ||
         h[3] != 1 || h[4] != 128 || h[5] != 128 || h[6] != h[2] + 1u ||
         h[8] != 40 || h[9] != 512 || h[10] != 128 || h[11] != DS4_N_VOCAB ||
-        h[12] != 0x413431u || remaining != ds41_payload_body_bytes(g, pos)) {
+        h[12] != DS41_PAYLOAD_TAG || remaining < ds41_payload_body_bytes(g, pos)) {
         payload_set_err(err, errlen, "invalid V4.1 snapshot dimensions or size");
         return 1;
     }
@@ -65325,14 +65779,38 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
             payload_set_err(err, errlen, "failed to restore V4.1 device logits");
             rc = 1;
         }
+        const double t0 = now_sec();
+        ds41_pack_stats st = {0};
         ds41_state_span spans[54];
         const uint32_t n = ds41_state_spans(g, pos, spans);
-        uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
-        for (uint32_t i = 0; i < n && !rc; i++)
-            rc = payload_read_tensor_span(fp, spans[i].tensor, 0, spans[i].bytes,
-                                           buf, DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
-        free(buf);
+        float *fbuf = xmalloc(DS4_SESSION_IO_CHUNK);
+        uint8_t *pbuf = xmalloc(DS4_SESSION_IO_CHUNK);
+        for (uint32_t i = 0; i < n && !rc; i++) {
+            if (spans[i].format != DS41_PACK_F32) {
+                const ds41_rows dst = {spans[i].tensor, NULL};
+                rc = ds41_read_packed_rows(fp, &dst, spans[i].format, spans[i].width,
+                                           spans[i].rows, fbuf, pbuf, DS4_SESSION_IO_CHUNK,
+                                           &remaining, &st, err, errlen);
+            } else {
+                const uint64_t bytes = spans[i].rows * spans[i].width * sizeof(float);
+                rc = payload_read_tensor_span(fp, spans[i].tensor, 0, bytes, pbuf,
+                                              DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
+                st.packed += bytes;
+                st.f32 += bytes;
+            }
+        }
+        free(fbuf);
+        free(pbuf);
+        if (!rc && remaining != 0) {
+            payload_set_err(err, errlen, "invalid V4.1 snapshot dimensions or size");
+            rc = 1;
+        }
         if (!rc) {
+            ds4_log(stderr, DS4_LOG_KVCACHE,
+                    "ds4: V4.1 state unpacked tokens=%u packed=%.2f MiB f32=%.2f MiB raw_blocks=%llu decode=%.1f ms\n",
+                    pos, (double)st.packed / (1024.0 * 1024.0),
+                    (double)st.f32 / (1024.0 * 1024.0),
+                    (unsigned long long)st.raw_blocks, (now_sec() - t0) * 1000.0);
             ds41_graph_reset(g);
             for (uint32_t i = 0; i < 3 && i < pos; i++)
                 g->history.tail[i] = (int32_t)g->token_map[tokens.v[pos - 1u - i]];
@@ -65375,8 +65853,13 @@ uint64_t ds4_session_payload_bytes(ds4_session *s) {
     if (ds4_session_is_ds41(s)) {
         if (!s->ds41_graph_ready || !s->ds41_graph.valid ||
             s->ds41_graph.pos != (uint32_t)s->checkpoint.len) return 0;
+        /* Raw blocks are only known by packing the rows. */
+        ds41_pack_stats st = {0};
+        if (!ds4_gpu_synchronize() ||
+            ds41_write_state(&s->ds41_graph, s->ds41_graph.pos, NULL, &st, NULL, 0))
+            return 0;
         return DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t) +
-               ds41_payload_body_bytes(&s->ds41_graph, (uint32_t)s->checkpoint.len);
+               ((uint64_t)s->checkpoint.len + DS4_N_VOCAB) * sizeof(float) + st.packed;
     }
 #endif
     if (ds4_session_is_cpu(s)) {

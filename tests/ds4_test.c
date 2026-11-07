@@ -7361,6 +7361,8 @@ static void test_print_help(const char *prog) {
     puts("  --metal-mpp-equivalence");
     puts("      Compatibility alias for --metal-tensor-equivalence.");
 #endif
+    puts("  --ds41-repack FILE...");
+    puts("      Pack the f32 V4.1 state of old cache files and check it decodes bit-identically.");
     puts("  -h, --help");
     puts("      Show this help.");
     puts("\nEnvironment:");
@@ -7414,7 +7416,134 @@ static void test_run_entry(const ds4_test_entry *entry) {
     fputc('\n', stderr);
 }
 
+typedef struct {
+    uint64_t rows;
+    uint32_t width;
+    int format;
+} test_ds41_repack_span;
+
+static double test_ds41_repack_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
+}
+
+/* Reads a KVC file holding an f32 V4.1 payload (payload ABI 2, tag "14A")
+ * without touching it, packs every state span with the packed-payload encoder,
+ * decodes it in memory and through the span writer and reader, and reports
+ * whether the f32 rows come back bit-identical and the packed payload size. */
+static int test_ds41_repack_file(const char *path) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        fprintf(stderr, "ds4-test: ds41-repack: %s: %s\n", path, strerror(errno));
+        return 1;
+    }
+    uint8_t h[KV_CACHE_FIXED_HEADER], b[4 * DS4_SESSION_PAYLOAD_U32_FIELDS];
+    uint32_t ph[DS4_SESSION_PAYLOAD_U32_FIELDS] = {0};
+    bool ok = fread(h, 1, sizeof(h), fp) == sizeof(h) &&
+              h[0] == 'K' && h[1] == 'V' && h[2] == 'C' &&
+              fread(b, 1, 4, fp) == 4 &&
+              fseeko(fp, (off_t)le_get32(b), SEEK_CUR) == 0 &&
+              fread(b, 1, sizeof(b), fp) == sizeof(b);
+    uint64_t payload_bytes = 0;
+    for (uint32_t i = 0; i < 8; i++) payload_bytes |= (uint64_t)h[40 + i] << (8u * i);
+    for (uint32_t i = 0; ok && i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) ph[i] = le_get32(b + 4u * i);
+    const uint32_t pos = ph[7], vocab = ph[11];
+    ok = ok && ph[0] == DS4_SESSION_PAYLOAD_MAGIC && ph[12] == 0x413431u &&
+         ph[8] == 40 && ph[9] == 512 && ph[10] == 128 && pos &&
+         fseeko(fp, (off_t)(((uint64_t)pos + vocab) * sizeof(float)), SEEK_CUR) == 0;
+    if (!ok) {
+        fprintf(stderr, "ds4-test: ds41-repack: %s is not an f32 V4.1 cache file\n", path);
+        fclose(fp);
+        return 1;
+    }
+
+    test_ds41_repack_span spans[54];
+    uint32_t n = 0;
+    for (uint32_t il = 0; il < 40; il++) spans[n++] = (test_ds41_repack_span){pos < 128u ? pos : 128u, 512, 1};
+    for (uint32_t i = 0; i < 4; i++) {
+        const uint64_t live = pos / (i < 3 ? 2u : 1u);
+        spans[n++] = (test_ds41_repack_span){live, 512, 3};
+        spans[n++] = (test_ds41_repack_span){live, 128, 2};
+        if (i < 3 && (pos & 1u)) {
+            spans[n++] = (test_ds41_repack_span){1, 512, 0};
+            spans[n++] = (test_ds41_repack_span){1, 512, 0};
+        }
+    }
+    uint64_t old_bytes = 4u * DS4_SESSION_PAYLOAD_U32_FIELDS + ((uint64_t)pos + vocab) * sizeof(float);
+    uint64_t new_bytes = old_bytes, raw_blocks = 0, values = 0;
+    uint64_t max_rows = 0;
+    for (uint32_t i = 0; i < n; i++)
+        if (spans[i].rows * spans[i].width > max_rows) max_rows = spans[i].rows * spans[i].width;
+    float *x = malloc(max_rows * sizeof(float));
+    float *raw = malloc(max_rows * sizeof(float));
+    float *y = malloc(max_rows * sizeof(float));
+    uint8_t *packed = malloc(max_rows * 2u);
+    double encode_s = 0.0, decode_s = 0.0;
+    bool exact = x && raw && y && packed;
+    char err[160] = {0};
+    for (uint32_t i = 0; i < n && exact; i++) {
+        const uint64_t count = spans[i].rows * spans[i].width;
+        if (fread(x, sizeof(float), (size_t)count, fp) != count) {
+            snprintf(err, sizeof(err), "truncated payload");
+            exact = false;
+            break;
+        }
+        old_bytes += count * sizeof(float);
+        if (spans[i].format == 0) {
+            new_bytes += count * sizeof(float);
+            continue;
+        }
+        const int format = spans[i].format;
+        const uint32_t width = spans[i].width;
+        double t0 = test_ds41_repack_now();
+        const uint64_t k = ds4_test_ds41_pack_rows(format, width, x, spans[i].rows, packed, raw);
+        encode_s += test_ds41_repack_now() - t0;
+        t0 = test_ds41_repack_now();
+        const uint64_t used = ds4_test_ds41_unpack_rows(format, width, packed, spans[i].rows, raw, y);
+        decode_s += test_ds41_repack_now() - t0;
+        exact = used == k && memcmp(x, y, (size_t)count * sizeof(float)) == 0;
+        uint64_t bytes = 0, span_raw = 0;
+        memset(y, 0, (size_t)count * sizeof(float));
+        if (exact && ds4_test_ds41_span_roundtrip(format, width, x, spans[i].rows,
+                                                  8u * 1024u * 1024u, y, &bytes,
+                                                  &span_raw, err, sizeof(err)) != 0)
+            exact = false;
+        exact = exact && span_raw == k && memcmp(x, y, (size_t)count * sizeof(float)) == 0;
+        if (!exact && !err[0]) snprintf(err, sizeof(err), "span %u differs after decoding", i);
+        new_bytes += bytes;
+        raw_blocks += k;
+        values += count;
+    }
+    fclose(fp);
+    free(x);
+    free(raw);
+    free(y);
+    free(packed);
+    if (exact && old_bytes != payload_bytes) {
+        snprintf(err, sizeof(err), "old layout covers %llu of %llu payload bytes",
+                 (unsigned long long)old_bytes, (unsigned long long)payload_bytes);
+        exact = false;
+    }
+    printf("ds4-test: ds41-repack %s tokens=%u old_payload=%llu (%.2f MiB) "
+           "new_payload=%llu (%.2f MiB) ratio=%.2fx raw_blocks=%llu values=%llu "
+           "encode=%.1f ms decode=%.1f ms bit_identical=%s%s%s\n",
+           path, pos, (unsigned long long)payload_bytes,
+           (double)payload_bytes / (1024.0 * 1024.0),
+           (unsigned long long)new_bytes, (double)new_bytes / (1024.0 * 1024.0),
+           (double)payload_bytes / (double)new_bytes,
+           (unsigned long long)raw_blocks, (unsigned long long)values,
+           encode_s * 1000.0, decode_s * 1000.0, exact ? "yes" : "no",
+           err[0] ? " error=" : "", err);
+    return exact ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
+    if (argc >= 3 && !strcmp(argv[1], "--ds41-repack")) {
+        int rc = 0;
+        for (int i = 2; i < argc; i++) rc |= test_ds41_repack_file(argv[i]);
+        return rc;
+    }
     if (argc == 4 && (!strcmp(argv[1], "--ds41-render") ||
                       !strcmp(argv[1], "--ds41-render-anthropic"))) {
         ds4_think_mode mode;
