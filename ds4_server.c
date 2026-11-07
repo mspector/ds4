@@ -12497,6 +12497,10 @@ static int server_session_sync(server *s, server_slot *slot,
         called = true;
         if (rc != 0) return rc;
         if (done >= prompt->len) return 0;
+        /* The chunk ended on a boundary and the live state stands exactly
+         * there, so store the continued checkpoint now; the store that runs
+         * inside the progress hook sees a chunk still being evaluated. */
+        if (step > 0 && done % step == 0) kv_cache_maybe_store_continued(s, slot);
         if (done < target) {
             if (err && errlen) snprintf(err, errlen, "prefill made no progress");
             return 1;
