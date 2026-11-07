@@ -137,6 +137,10 @@ int ds4_kvstore_chat_anchor_pos(const ds4_kvstore *kc,
                                 int user_token_id,
                                 int assistant_token_id);
 int ds4_kvstore_continued_store_target(const ds4_kvstore *kc, int live_tokens);
+/* The interval, aligned, at which continued checkpoints are stored; 0 when
+ * the store is off.  A prefill that ends its chunks on multiples of it
+ * stores a checkpoint at every boundary it crosses. */
+int ds4_kvstore_continued_interval(const ds4_kvstore *kc);
 void ds4_kvstore_note_store(ds4_kvstore *kc, int tokens);
 int ds4_kvstore_suppress_continued_store(ds4_kvstore *kc, int tokens);
 void ds4_kvstore_restore_suppressed_continued(ds4_kvstore *kc,

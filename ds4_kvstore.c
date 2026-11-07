@@ -744,6 +744,10 @@ static int kv_cache_continued_step(const ds4_kvstore *kc) {
     return step;
 }
 
+int ds4_kvstore_continued_interval(const ds4_kvstore *kc) {
+    return kc ? kv_cache_continued_step(kc) : 0;
+}
+
 int ds4_kvstore_continued_store_target(const ds4_kvstore *kc, int live_tokens) {
     const int step = kv_cache_continued_step(kc);
     if (step <= 0) return 0;
