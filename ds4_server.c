@@ -10063,9 +10063,10 @@ struct server_slot {
     /* Wall time of the last completed job on this slot, stamped by the slot
      * worker; drives the staleness tiers in job_slot_score(). */
     time_t last_used;
-    /* Cached rendered text of the checkpoint, refreshed by the slot worker
-     * after each job; lets the reuse probe (slot_probe_reuse_locked) answer
-     * the memory-text question with a memcmp instead of a detokenization. */
+    /* Cached rendered text of the checkpoint, normalized as the disk text key
+     * is (ds4_kvstore_text_key_normalize), refreshed by the slot worker after
+     * each job; lets the reuse probe (slot_probe_reuse_locked) answer the
+     * memory-text question with a byte walk instead of a detokenization. */
     char *live_text;
     size_t live_text_len;
     int live_text_pos;              /* checkpoint.len at render time; 0 = stale */
@@ -11610,7 +11611,10 @@ static bool build_live_prompt_suffix(server *s, server_slot *slot,
  *   omits the hidden reasoning by design; the remembered visible transcript
  *   is the key that keeps the sampled hidden KV.
  * - memory-text: the checkpoint's rendered text is a byte prefix of the
- *   request text.  Resent history is re-tokenized, and canonical BPE/DSML
+ *   request text, both with trailing spaces and tabs before each newline
+ *   ignored (a client may strip them from a model's lines it resends);
+ *   suffix_off is the raw request offset after the matched prefix.  Resent
+ *   history is re-tokenized, and canonical BPE/DSML
  *   tokenization need not reproduce the sampled token ids; the live graph
  *   is authoritative, so the checkpoint tokens are kept verbatim and only
  *   the suffix text is tokenized (full-prompt BPE may have merged across
@@ -11764,13 +11768,14 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
         }
     }
 
+    size_t text_off = 0;
     if (ptext && slot->live_text && slot->live_text_pos == live_pos &&
-        slot->live_text_len <= plen &&
-        byte_prefix_match(ptext, plen, slot->live_text, slot->live_text_len))
+        ds4_kvstore_text_key_prefix(ptext, plen, slot->live_text,
+                                    slot->live_text_len, &text_off))
     {
         pr.kind = REUSE_MEMORY_TEXT;
         pr.reuse_tokens = live_pos;
-        pr.suffix_off = slot->live_text_len;
+        pr.suffix_off = text_off;
         return pr;
     }
 
@@ -11815,8 +11820,13 @@ static void slot_refresh_live_text(server *s, server_slot *slot) {
     }
     const ds4_tokens *live = ds4_session_tokens(slot->session);
     if (!live || live->len <= 0) return;
-    slot->live_text = render_tokens_text(s->engine, live, &slot->live_text_len);
-    if (slot->live_text) slot->live_text_pos = live->len;
+    size_t raw_len = 0;
+    char *raw = render_tokens_text(s->engine, live, &raw_len);
+    if (!raw) return;
+    slot->live_text = ds4_kvstore_text_key_normalize(raw, raw_len,
+                                                     &slot->live_text_len);
+    free(raw);
+    slot->live_text_pos = live->len;
 }
 
 /* =========================================================================
@@ -13029,7 +13039,10 @@ static void kv_cache_store_turn_end(server *s, server_slot *slot, job *j,
     if (!skip) {
         /* Render the key only to report it; the store renders the same tokens
          * again and remains the only writer of the file. */
-        char *text = render_tokens_text(s->engine, tokens, &text_len);
+        size_t raw_len = 0;
+        char *raw = render_tokens_text(s->engine, tokens, &raw_len);
+        char *text = ds4_kvstore_text_key_normalize(raw, raw_len, &text_len);
+        free(raw);
         char sha[41];
         ds4_kvstore_sha1_bytes_hex(text, text_len, sha);
         free(text);
@@ -16620,6 +16633,48 @@ static void test_slot_probe_and_routing_scores(void) {
     ds4_tokens_free(&sub.req.prompt);
     ds4_tokens_free(&ext.req.prompt);
     ds4_tokens_free(&txt.req.prompt);
+}
+
+/* The memory-text tier compares the normalized live text with the request
+ * text normalized the same way, and suffix_off is the raw request offset. */
+static void test_slot_probe_memory_text_ignores_line_trailing_space(void) {
+    server s = {0};
+    int tok[3] = {5, 6, 7};
+    server_slot slot = {0};
+    slot.session = ds4_session_new_test_checkpoint(tok, 3);
+    const char *live_raw = "think: agent? \nok.\t\nanswer";
+    slot.live_text = ds4_kvstore_text_key_normalize(live_raw, strlen(live_raw),
+                                                    &slot.live_text_len);
+    slot.live_text_pos = 3;
+
+    static const struct {
+        const char *prompt;
+        const char *suffix;
+    } cases[] = {
+        {"think: agent?\nok.\nanswer<eos><user>next", "<eos><user>next"},
+        {"think: agent?\t \nok.  \nanswer<eos>", "<eos>"},
+        {"think: agent? \nok.\t\nanswer more", " more"},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        job j = {0};
+        ds4_tokens_push(&j.req.prompt, 5);
+        ds4_tokens_push(&j.req.prompt, 999);  /* token prefix diverges */
+        j.req.prompt_text = (char *)cases[i].prompt;
+        slot_reuse pr = slot_probe_reuse_locked(&s, &slot, &j.req);
+        TEST_ASSERT(pr.kind == REUSE_MEMORY_TEXT);
+        TEST_ASSERT(pr.reuse_tokens == 3);
+        TEST_ASSERT(!strcmp(cases[i].prompt + pr.suffix_off, cases[i].suffix));
+        ds4_tokens_free(&j.req.prompt);
+    }
+
+    job miss = {0};
+    ds4_tokens_push(&miss.req.prompt, 5);
+    miss.req.prompt_text = (char *)"think: agent? ok.\nanswer more";
+    TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &miss.req).kind == REUSE_NONE);
+    ds4_tokens_free(&miss.req.prompt);
+
+    free(slot.live_text);
+    ds4_session_free_test_checkpoint(slot.session);
 }
 
 /* Staleness tiers: a resident checkpoint idle past SLOT_STALE_AFTER_SEC is
@@ -22128,6 +22183,88 @@ static void test_kv_cache_lookup_uses_longest_text_prefix(void) {
     rmdir(dir);
 }
 
+/* The model sampled "agent? \n" (trailing space before the newline); the
+ * client resends "agent?\n".  The text key ignores trailing spaces and tabs
+ * before a newline on both sides, and the suffix starts at the raw prompt
+ * offset after the matched prefix. */
+static void test_kv_cache_text_key_ignores_line_trailing_space(void) {
+    size_t n = 0;
+    char *norm = ds4_kvstore_text_key_normalize("a \t\nb  \n  c\n\n d  ", 17, &n);
+    TEST_ASSERT(n == strlen("a\nb\n  c\n\n d  "));
+    TEST_ASSERT(!strcmp(norm, "a\nb\n  c\n\n d  "));
+    free(norm);
+
+    char tmpl[] = "/tmp/ds4-kv-line-space-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    /* What the store writes for live text "think: agent? \nok.\t\nanswer". */
+    const char *live_raw = "think: agent? \nok.\t\nanswer";
+    size_t key_len = 0;
+    char *key = ds4_kvstore_text_key_normalize(live_raw, strlen(live_raw),
+                                               &key_len);
+    TEST_ASSERT(!strcmp(key, "think: agent?\nok.\nanswer"));
+    test_kv_text_stub_file(dir, key, KV_REASON_TURN_END, 640, 0);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+
+    static const struct {
+        const char *prompt;
+        const char *suffix;
+    } cases[] = {
+        /* The client stripped the trailing whitespace. */
+        {"think: agent?\nok.\nanswer<eos><user>next", "<eos><user>next"},
+        /* The raw prompt keeps different trailing whitespace inside the
+         * matched region. */
+        {"think: agent?\t \nok.  \nanswer<eos>", "<eos>"},
+        /* The live text matched exactly. */
+        {"think: agent? \nok.\t\nanswer more", " more"},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const char *prompt = cases[i].prompt;
+        const size_t plen = strlen(prompt);
+        int idx = kv_cache_find_text_prefix(&kc, prompt, 2, 32768);
+        TEST_ASSERT(idx >= 0);
+        TEST_ASSERT(idx >= 0 && kc.entry[idx].tokens == 640);
+        TEST_ASSERT(idx >= 0 && kc.entry[idx].text_bytes == key_len);
+        int pinned = -1;
+        TEST_ASSERT(ds4_kvstore_count_text_prefixes(&kc, prompt, 0, 2, 32768,
+                                                    &pinned) == 1);
+        /* try_load_text maps the stored text length back to the raw offset
+         * this way before tokenizing the suffix. */
+        size_t off = 0;
+        TEST_ASSERT(ds4_kvstore_text_key_prefix(prompt, plen, NULL, key_len, &off));
+        TEST_ASSERT(!strcmp(prompt + off, cases[i].suffix));
+        size_t cmp_off = 0;
+        TEST_ASSERT(ds4_kvstore_text_key_prefix(prompt, plen, key, key_len, &cmp_off));
+        TEST_ASSERT(cmp_off == off);
+    }
+
+    /* A trailing space not before a newline still counts. */
+    TEST_ASSERT(kv_cache_find_text_prefix(&kc, "think: agent? ok.\nanswer!", 2, 32768) < 0);
+    TEST_ASSERT(!ds4_kvstore_text_key_prefix("think: agent ?\nok.\nanswer", 25,
+                                             key, key_len, NULL));
+    /* A key that ends before a dropped run leaves the run in the suffix. */
+    size_t off = 0;
+    TEST_ASSERT(ds4_kvstore_text_key_prefix("agent?  \nX", 10, "agent?", 6, &off));
+    TEST_ASSERT(off == 6);
+
+    kv_cache_close(&kc);
+    char sha[41];
+    sha1_bytes_hex(key, key_len, sha);
+    char name[44];
+    snprintf(name, sizeof(name), "%.40s.kv", sha);
+    char *path = path_join(dir, name);
+    unlink(path);
+    free(path);
+    free(key);
+    rmdir(dir);
+}
+
 static void test_kv_cache_lookup_rejects_wrong_model(void) {
     char tmpl[] = "/tmp/ds4-kv-model-id-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -23765,6 +23902,7 @@ static void ds4_server_unit_tests_run(void) {
     test_batched_live_continuation_slot_binding();
     test_live_continuation_contract();
     test_slot_probe_and_routing_scores();
+    test_slot_probe_memory_text_ignores_line_trailing_space();
     test_slot_probe_live_state_tiers();
     test_slot_probe_vision_tiers();
     test_slot_routing_staleness_tiers();
@@ -23912,6 +24050,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_file_size_must_fit_budget();
     test_sha1_bytes_hex_matches_known_vector();
     test_kv_cache_lookup_uses_longest_text_prefix();
+    test_kv_cache_text_key_ignores_line_trailing_space();
     test_kv_cache_lookup_rejects_wrong_model();
     test_kv_cache_lookup_rejects_stale_payload_abi();
     test_kv_cache_eviction_values_fresh_snapshots();

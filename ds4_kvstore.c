@@ -730,6 +730,57 @@ bool ds4_kvstore_byte_prefix_match(const char *text, size_t text_len,
            (prefix_len == 0 || memcmp(text, prefix, prefix_len) == 0);
 }
 
+static bool kv_line_space(char c) {
+    return c == ' ' || c == '\t';
+}
+
+char *ds4_kvstore_text_key_normalize(const char *text, size_t len,
+                                     size_t *out_len) {
+    char *out = kv_xmalloc(len + 1);
+    size_t n = 0;
+    for (size_t i = 0; i < len;) {
+        if (kv_line_space(text[i])) {
+            size_t j = i;
+            while (j < len && kv_line_space(text[j])) j++;
+            if (j == len || text[j] != '\n') {
+                memcpy(out + n, text + i, j - i);
+                n += j - i;
+            }
+            i = j;
+            continue;
+        }
+        out[n++] = text[i++];
+    }
+    out[n] = '\0';
+    if (out_len) *out_len = n;
+    return out;
+}
+
+bool ds4_kvstore_text_key_prefix(const char *raw, size_t raw_len,
+                                 const char *key, size_t key_len,
+                                 size_t *raw_off) {
+    size_t i = 0, n = 0;
+    while (n < key_len) {
+        if (i >= raw_len) return false;
+        size_t take = 1;
+        if (kv_line_space(raw[i])) {
+            size_t j = i;
+            while (j < raw_len && kv_line_space(raw[j])) j++;
+            if (j < raw_len && raw[j] == '\n') {
+                i = j;
+                continue;
+            }
+            take = j - i;
+            if (take > key_len - n) take = key_len - n;
+        }
+        if (key && memcmp(raw + i, key + n, take) != 0) return false;
+        i += take;
+        n += take;
+    }
+    if (raw_off) *raw_off = i;
+    return true;
+}
+
 void ds4_kvstore_tokens_copy_prefix(ds4_tokens *dst, const ds4_tokens *src, int n) {
     dst->len = 0;
     if (!src) return;
@@ -1065,17 +1116,23 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         ds4_tokens_free(&store_tokens);
         return false;
     }
+    /* The key is the normalized text (ds4_kvstore_text_key_normalize); the
+     * trailer hooks keep the raw text, since tool replay matches the exact
+     * sampled DSML bytes. */
+    size_t key_len = 0;
+    char *key = ds4_kvstore_text_key_normalize(text, text_len, &key_len);
     char sha[41];
-    ds4_kvstore_sha1_bytes_hex(text, text_len, sha);
+    ds4_kvstore_sha1_bytes_hex(key, key_len, sha);
     char *path = ds4_kvstore_path_for_sha(kc, sha);
     const uint8_t reason_code = ds4_kvstore_reason_code(reason);
 
-    if (kv_cache_existing_compatible(kc, path, sha, text, text_len,
+    if (kv_cache_existing_compatible(kc, path, sha, key, key_len,
                                      model_id,
                                      quant_bits, ds4_session_ctx(session))) {
         kv_cache_rewrite_trailer(kc, path, text, hooks);
         kv_cache_pin_stored(kc, sha, store_tokens.len, reason, path);
         free(text);
+        free(key);
         free(path);
         ds4_tokens_free(&store_tokens);
         return true;
@@ -1093,6 +1150,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         if (err && err_len) snprintf(err, err_len, "%s",
                                      save_err[0] ? save_err : "unknown error");
         free(text);
+        free(key);
         free(path);
         ds4_tokens_free(&store_tokens);
         return false;
@@ -1100,7 +1158,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     uint64_t payload_bytes = staged.bytes;
 
     uint64_t est_file_bytes = 0, est_required_bytes = 0;
-    if (!ds4_kvstore_file_size_fits(kc, (uint64_t)text_len, payload_bytes,
+    if (!ds4_kvstore_file_size_fits(kc, (uint64_t)key_len, payload_bytes,
                                     trailer_est_bytes,
                                     &est_file_bytes, &est_required_bytes)) {
         kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
@@ -1113,14 +1171,15 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                 (double)kc->budget_bytes / (1024.0 * 1024.0));
         ds4_session_payload_file_free(&staged);
         free(text);
+        free(key);
         free(path);
         ds4_tokens_free(&store_tokens);
         return false;
     }
 
     ds4_kvstore_eviction_context incoming = {
-        .text = text,
-        .text_len = text_len,
+        .text = key,
+        .text_len = key_len,
         .model_id = (uint8_t)model_id,
         .quant_bits = (uint8_t)quant_bits,
         .ctx_size = (uint32_t)ds4_session_ctx(session),
@@ -1137,6 +1196,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                 (double)kc->budget_bytes / (1024.0 * 1024.0));
         ds4_session_payload_file_free(&staged);
         free(text);
+        free(key);
         free(path);
         ds4_tokens_free(&store_tokens);
         return false;
@@ -1155,6 +1215,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         ds4_session_payload_file_free(&staged);
         free(tmp);
         free(text);
+        free(key);
         free(path);
         ds4_tokens_free(&store_tokens);
         return false;
@@ -1170,12 +1231,12 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                             (uint32_t)ds4_session_ctx(session),
                             now, now, payload_bytes);
     uint8_t tb[4];
-    ds4_kvstore_le_put32(tb, (uint32_t)text_len);
+    ds4_kvstore_le_put32(tb, (uint32_t)key_len);
     uint64_t trailer_bytes = 0;
     errno = 0;
     bool ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
               fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
-              fwrite(text, 1, text_len, fp) == text_len &&
+              fwrite(key, 1, key_len, fp) == key_len &&
               ds4_session_write_staged_payload(&staged, fp,
                                                save_err, sizeof(save_err)) == 0 &&
               kv_trailer_write(hooks, fp, text, &trailer_bytes) &&
@@ -1187,7 +1248,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     }
     uint64_t final_file_bytes = 0, final_required_bytes = 0;
     bool final_size_over_budget = false;
-    if (ok && !ds4_kvstore_file_size_fits(kc, (uint64_t)text_len, payload_bytes,
+    if (ok && !ds4_kvstore_file_size_fits(kc, (uint64_t)key_len, payload_bytes,
                                           trailer_bytes,
                                           &final_file_bytes,
                                           &final_required_bytes))
@@ -1234,13 +1295,14 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                 original_len - store_tokens.len,
                 reason,
                 text_override ? (cache_text_key ? cache_text_key : "visible-transcript") : "token-text",
-                (double)(DS4_KVSTORE_FIXED_HEADER + 4ull + text_len + payload_bytes + trailer_bytes) / (1024.0 * 1024.0),
+                (double)(DS4_KVSTORE_FIXED_HEADER + 4ull + key_len + payload_bytes + trailer_bytes) / (1024.0 * 1024.0),
                 save_ms);
         kv_cache_pin_stored(kc, sha, store_tokens.len, reason, path);
     }
     ds4_session_payload_file_free(&staged);
     free(tmp);
     free(text);
+    free(key);
     free(path);
     ds4_tokens_free(&store_tokens);
     return ok;
@@ -1291,15 +1353,16 @@ static bool kv_cache_entry_may_prefix(const ds4_kvstore *kc,
     return true;
 }
 
-int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
-                                 int model_id, int quant_bits, int ctx_size) {
-    if (!prompt_text) return -1;
-    const size_t prompt_bytes = strlen(prompt_text);
+/* key is the normalized prompt text. */
+static int kv_cache_find_text_key_prefix(ds4_kvstore *kc,
+                                         const char *key, size_t key_len,
+                                         int model_id, int quant_bits,
+                                         int ctx_size) {
     kv_cache_refresh(kc);
     int best = -1;
     for (int i = 0; i < kc->len; i++) {
         ds4_kvstore_entry *e = &kc->entry[i];
-        if (!kv_cache_entry_may_prefix(kc, e, prompt_bytes, model_id,
+        if (!kv_cache_entry_may_prefix(kc, e, key_len, model_id,
                                        quant_bits, ctx_size)) continue;
         if (best >= 0) {
             ds4_kvstore_entry *b = &kc->entry[best];
@@ -1307,9 +1370,21 @@ int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
             if (e->text_bytes == b->text_bytes && e->tokens <= b->tokens) continue;
         }
         char sha[41];
-        ds4_kvstore_sha1_bytes_hex(prompt_text, (size_t)e->text_bytes, sha);
+        ds4_kvstore_sha1_bytes_hex(key, (size_t)e->text_bytes, sha);
         if (!strcmp(sha, e->sha)) best = i;
     }
+    return best;
+}
+
+int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
+                                 int model_id, int quant_bits, int ctx_size) {
+    if (!prompt_text) return -1;
+    size_t key_len = 0;
+    char *key = ds4_kvstore_text_key_normalize(prompt_text, strlen(prompt_text),
+                                               &key_len);
+    const int best = kv_cache_find_text_key_prefix(kc, key, key_len, model_id,
+                                                   quant_bits, ctx_size);
+    free(key);
     return best;
 }
 
@@ -1318,19 +1393,22 @@ int ds4_kvstore_count_text_prefixes(ds4_kvstore *kc, const char *prompt_text,
                                     int *pinned_out) {
     if (pinned_out) *pinned_out = 0;
     if (!prompt_text) return 0;
-    const size_t prompt_bytes = strlen(prompt_text);
+    size_t key_len = 0;
+    char *key = ds4_kvstore_text_key_normalize(prompt_text, strlen(prompt_text),
+                                               &key_len);
     kv_cache_refresh(kc);
     int count = 0;
     for (int i = 0; i < kc->len; i++) {
         ds4_kvstore_entry *e = &kc->entry[i];
-        if (!kv_cache_entry_may_prefix(kc, e, prompt_bytes, model_id,
+        if (!kv_cache_entry_may_prefix(kc, e, key_len, model_id,
                                        quant_bits, ctx_size)) continue;
         char sha[41];
-        ds4_kvstore_sha1_bytes_hex(prompt_text, (size_t)e->text_bytes, sha);
+        ds4_kvstore_sha1_bytes_hex(key, (size_t)e->text_bytes, sha);
         if (strcmp(sha, e->sha)) continue;
         count++;
         if (pinned_out && ds4_kvstore_is_pinned(kc, e->sha)) (*pinned_out)++;
     }
+    free(key);
     return count;
 }
 
@@ -1349,15 +1427,23 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
     if (!ds4_kvstore_quant_bits_supported(quant_bits)) return 0;
     const int model_id = ds4_engine_model_id(engine);
     const size_t prompt_bytes = strlen(prompt_text);
-    int idx = ds4_kvstore_find_text_prefix(kc, prompt_text, model_id, quant_bits,
-                                           ds4_session_ctx(session));
-    if (idx < 0) return 0;
+    size_t key_len = 0;
+    char *key = ds4_kvstore_text_key_normalize(prompt_text, prompt_bytes,
+                                               &key_len);
+    int idx = kv_cache_find_text_key_prefix(kc, key, key_len, model_id,
+                                            quant_bits,
+                                            ds4_session_ctx(session));
+    if (idx < 0) {
+        free(key);
+        return 0;
+    }
 
     ds4_kvstore_entry e = kc->entry[idx];
     char *path = kv_xstrdup(e.path);
     const double load_t0 = kv_now_sec();
     FILE *fp = fopen(path, "rb");
     if (!fp) {
+        free(key);
         free(path);
         return 0;
     }
@@ -1370,7 +1456,7 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
         if (hdr.model_id != (uint8_t)model_id) {
             header_ok = false;
             fail_reason = "cached checkpoint was written for a different model";
-        } else if ((uint64_t)text_bytes > prompt_bytes) {
+        } else if ((uint64_t)text_bytes > key_len) {
             header_ok = false;
             fail_reason = "cached text is longer than prompt";
         } else {
@@ -1385,7 +1471,7 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
                 if (strcmp(text_sha, e.sha)) {
                     header_ok = false;
                     fail_reason = "cached text hash mismatch";
-                } else if (!ds4_kvstore_byte_prefix_match(prompt_text, prompt_bytes,
+                } else if (!ds4_kvstore_byte_prefix_match(key, key_len,
                                                           cached_text, text_bytes)) {
                     header_ok = false;
                     fail_reason = "cached text prefix mismatch";
@@ -1402,12 +1488,16 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
         if (loaded_tokens && loaded_tokens->len == (int)hdr.tokens) {
             loaded = (int)hdr.tokens;
             if (effective_prompt) {
-                /* The cache lookup was by bytes, but the graph state is still
-                 * the exact token history stored in the payload.  Build the
-                 * prompt from that exact history and tokenize only the text
-                 * suffix after the byte prefix. */
+                /* The cache lookup was by normalized bytes, but the graph
+                 * state is still the exact token history stored in the
+                 * payload.  Build the prompt from that exact history and
+                 * tokenize only the raw text suffix after the matched
+                 * prefix. */
+                size_t suffix_off = prompt_bytes;
+                ds4_kvstore_text_key_prefix(prompt_text, prompt_bytes, NULL,
+                                            text_bytes, &suffix_off);
                 ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
-                    engine, loaded_tokens, prompt_text + text_bytes,
+                    engine, loaded_tokens, prompt_text + suffix_off,
                     effective_prompt);
             }
             if (hooks && hooks->load && (hdr.ext_flags & hooks->ext_flag)) {
@@ -1457,6 +1547,7 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
         }
     }
     free(cached_text);
+    free(key);
     free(path);
     return loaded;
 }

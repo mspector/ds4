@@ -133,6 +133,20 @@ char *ds4_kvstore_render_tokens_text(ds4_engine *engine,
                                      size_t *out_len);
 bool ds4_kvstore_byte_prefix_match(const char *text, size_t text_len,
                                    const char *prefix, size_t prefix_len);
+/* The text tier keys and compares text with every run of spaces and tabs
+ * that ends a line (is followed by '\n') removed; nothing else changes, and
+ * spaces or tabs at the very end of the text, with no '\n' after them, are
+ * kept.  A client may strip trailing whitespace from the lines of a model's
+ * text it resends; the live state keeps the sampled bytes either way. */
+char *ds4_kvstore_text_key_normalize(const char *text, size_t len,
+                                     size_t *out_len);
+/* Whether key (key_len normalized bytes) is a prefix of the normalized raw
+ * text.  On success *raw_off is the raw offset just past the raw byte that
+ * produced the last key byte, so raw + *raw_off is the raw suffix.  key may be
+ * NULL to map a normalized length to its raw offset without comparing. */
+bool ds4_kvstore_text_key_prefix(const char *raw, size_t raw_len,
+                                 const char *key, size_t key_len,
+                                 size_t *raw_off);
 void ds4_kvstore_tokens_copy_prefix(ds4_tokens *dst, const ds4_tokens *src, int n);
 void ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
         ds4_engine *engine,
